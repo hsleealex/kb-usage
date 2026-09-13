@@ -1,0 +1,8 @@
+kb-usage-menubar
+menubar.log
+model_usage.json
+rate_limits.json
+sessions/
+__pycache__/
+*.pyc
+.DS_Store
