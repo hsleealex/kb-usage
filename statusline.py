@@ -31,6 +31,13 @@ SESS_DIR = os.path.join(BASE, "sessions")
 STALE_SECONDS = 1800  # 창 자체 나이가 이걸 넘으면 배너에 '?' 마커
 SESS_KEEP_SECONDS = 86400  # 이보다 오래된 세션 파일은 청소
 
+# output_style.name → 상태줄에 보일 짧은 태그. "default" 는 아무것도 안 보임.
+# 매핑에 없는 이름은 이름 그대로 보여준다(새 output style 추가돼도 안 깨지게).
+AGENT_TAGS = {
+    "돌쇠": "🧑‍🌾 돌쇠",
+    "개똥이": "🔧 개똥이",
+}
+
 
 def load_stored():
     """마지막 스냅샷을 읽는다. 없거나 깨졌으면 빈 dict."""
@@ -277,8 +284,18 @@ def main():
             seg += " (%dh%02dm)" % (h, m) if h else " (%dm)" % m
         parts.append(seg)
 
+    style = (data.get("output_style") or {}).get("name")
+    agent_tag = None
+    if style and style != "default":
+        agent_tag = AGENT_TAGS.get(style, style)
+
     model = (data.get("model") or {}).get("display_name")
-    prefix = "%s  " % model if model else ""
+
+    prefix = ""
+    if agent_tag:
+        prefix += "%s  " % agent_tag
+    if model:
+        prefix += "%s  " % model
 
     if parts:
         print(prefix + "  ".join(parts))
