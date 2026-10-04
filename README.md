@@ -1,3 +1,5 @@
+<p align="center"><img src="bundle/AppIcon-1024.png" width="128" alt="kb-usage icon"></p>
+
 # kb-usage — Claude · Codex 사용 한도 맥 메뉴바 표시기
 
 맥 메뉴바에 Claude 사용 한도(5시간 창 / 주간)와 Codex(ChatGPT 구독) 한도를
