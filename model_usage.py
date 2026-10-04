@@ -44,15 +44,17 @@ WEEK = 7 * 86400
 
 # 모델 id -> 팝오버에 쓸 짧은 라벨
 LABELS = {
-    "claude-opus-5": "Opus",
+    "claude-opus-5-5": "Opus 5.5",
+    "claude-opus-5": "Opus 5",
     "claude-opus-4-8": "Opus 4.8",
     "claude-opus-4-7": "Opus 4.7",
     "claude-opus-4-6": "Opus 4.6",
-    "claude-sonnet-5": "Sonnet",
+    "claude-sonnet-5-5": "Sonnet 5.5",
+    "claude-sonnet-5": "Sonnet 5",
     "claude-sonnet-4-6": "Sonnet 4.6",
     "claude-haiku-4-5": "Haiku",
-    "claude-fable-5": "Fable",
-    "claude-fable-5-1": "Fable",
+    "claude-fable-5": "Fable 5",
+    "claude-fable-5-1": "Fable 5.1",
 }
 
 
