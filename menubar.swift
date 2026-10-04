@@ -1006,10 +1006,14 @@ final class ListHeadView: NSView {
 // 단계별로 시도하고 0.3초 뒤 실제 맨 앞 앱 pid 로 확인, 되면 멈춘다 (menubar.log 에 기록):
 //   coop      우리 앱을 먼저 active 로 만든 뒤 협력적 활성화 (macOS 14+: activate(from:))
 //   all       activate(options: .activateAllWindows)
+//   ae        그 pid 에 raw Apple Event activate(misc/actv). 이미 Automation 권한이 있는
+//             대상(= Ghostty)에만 보내고 묻지 않는다 — 새 권한 팝업 없음.
 //   sysevents System Events 로 그 unix id 프로세스 frontmost = true (osascript).
-//             처음 한 번 "System Events 제어" Automation 권한을 물을 수 있다.
-// 로그에는 key 앞 8자·pid·결과만 남긴다.
-let FOCUS_STEPS = ["coop", "all", "sysevents"]
+//             "System Events 제어" 권한이 이미 허용(0)일 때만. 거부·미결정이면 건너뛴다 (팝업 안 띄움).
+// coop/all 은 NSRunningApplication 이 있어야 해서, 못 찾으면 건너뛰고 ae → sysevents 로.
+// 로그에는 key 앞 8자·pid·단계·결과만 남긴다.
+let FOCUS_STEPS = ["coop", "all", "ae", "sysevents"]
+let GHOSTTY_ID = "com.mitchellh.ghostty"
 
 func logLine(_ s: String) {
     let f = ISO8601DateFormatter()
@@ -1021,24 +1025,67 @@ func keyTag(_ key: String) -> String {
 }
 func frontPid() -> Int32? { NSWorkspace.shared.frontmostApplication?.processIdentifier }
 
-func runFocusStep(_ step: String, _ app: NSRunningApplication) -> Bool {
+// pid → NSRunningApplication. init(processIdentifier:) 가 잠깐 nil 을 줄 때가 있다
+// (2026-10-04 21:52Z: Ghostty 가 Fcus 로 막 frontmost 가 되던 순간, 직전엔 같은 pid 를 찾았는데 nil).
+// 그러면 실행 중 앱 목록(번들 id → 전체)에서 pid 로 한 번 더 찾는다.
+func lookupApp(_ pid: Int32, tag: String) -> NSRunningApplication? {
+    if let a = NSRunningApplication(processIdentifier: pid) { return a }
+    logLine("focus \(tag) pid=\(pid) lookup=init ret=nil")
+    let b = NSRunningApplication.runningApplications(withBundleIdentifier: GHOSTTY_ID)
+        .first { $0.processIdentifier == pid }
+    logLine("focus \(tag) pid=\(pid) lookup=bundle ret=\(b != nil)")
+    if let b { return b }
+    let w = NSWorkspace.shared.runningApplications.first { $0.processIdentifier == pid }
+    logLine("focus \(tag) pid=\(pid) lookup=workspace ret=\(w != nil)")
+    return w
+}
+
+// 그 pid 에 Apple Event activate(misc/actv). 권한이 이미 허용일 때만 보낸다 (묻지 않음, 응답 안 기다림).
+// 반환 0 = 보냄. 아니면 권한 상태(-1743 거부, -1744 미결정, -600 대상 없음) 또는 전송 오류 번호.
+func aeActivate(_ pid: Int32) -> Int {
+    let target = NSAppleEventDescriptor(processIdentifier: pid)
+    guard let d = target.aeDesc else { return Int(procNotFound) }
+    let st = AEDeterminePermissionToAutomateTarget(d, fcc("misc"), fcc("actv"), false)
+    if st != noErr { return Int(st) }
+    let ev = NSAppleEventDescriptor(eventClass: fcc("misc"), eventID: fcc("actv"), targetDescriptor: target,
+                                    returnID: AEReturnID(kAutoGenerateReturnID), transactionID: AETransactionID(kAnyTransactionID))
+    do { _ = try ev.sendEvent(options: [.noReply], timeout: 1); return 0 }
+    catch { return (error as NSError).code }
+}
+
+// "System Events 제어" 권한 상태 (묻지 않음). 0 허용, -1743 거부, -1744 미결정, -600 실행 안 됨
+func syseventsPermission() -> Int {
+    guard let d = NSAppleEventDescriptor(bundleIdentifier: "com.apple.systemevents").aeDesc
+    else { return Int(procNotFound) }
+    return Int(AEDeterminePermissionToAutomateTarget(d, AEEventClass(typeWildCard), AEEventID(typeWildCard), false))
+}
+
+// 반환: "skip(이유)" = 시도 안 함(확인 대기 없이 다음 단계로), 그 외 = 시도한 결과
+func runFocusStep(_ step: String, pid: Int32, app: NSRunningApplication?) -> String {
     switch step {
     case "coop":
+        guard let app else { return "skip(no-app)" }
         if #available(macOS 14.0, *) {
             NSApp.activate()
             NSApp.yieldActivation(to: app)
-            return app.activate(from: NSRunningApplication.current, options: [.activateAllWindows])
+            return "\(app.activate(from: NSRunningApplication.current, options: [.activateAllWindows]))"
         }
-        return app.activate(options: [.activateAllWindows])
+        return "\(app.activate(options: [.activateAllWindows]))"
     case "all":
-        return app.activate(options: [.activateAllWindows])
+        guard let app else { return "skip(no-app)" }
+        return "\(app.activate(options: [.activateAllWindows]))"
+    case "ae":
+        let r = aeActivate(pid)
+        return r == 0 ? "0" : "skip(\(r))"
     case "sysevents":
+        let perm = syseventsPermission()
+        if perm != 0 { return "skip(perm=\(perm))" }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         p.arguments = ["-e", "tell application \"System Events\" to set frontmost of " +
-                       "(first process whose unix id is \(app.processIdentifier)) to true"]
+                       "(first process whose unix id is \(pid)) to true"]
         let err = Pipe(); p.standardError = err; p.standardOutput = FileHandle.nullDevice
-        guard (try? p.run()) != nil else { return false }
+        guard (try? p.run()) != nil else { return "false" }
         p.waitUntilExit()
         if p.terminationStatus != 0 {
             // 권한 거부 등은 osascript 오류 번호만 (예: -1743 = Automation 권한 없음)
@@ -1046,27 +1093,35 @@ func runFocusStep(_ step: String, _ app: NSRunningApplication) -> Bool {
             let code = msg.range(of: #"\(-?\d+\)"#, options: .regularExpression).map { String(msg[$0]) } ?? ""
             logLine("  sysevents osascript exit=\(p.terminationStatus) \(code)")
         }
-        return p.terminationStatus == 0
+        return "\(p.terminationStatus == 0)"
     default:
-        return false
+        return "skip(unknown)"
     }
 }
 
 // pid 를 앞으로. 끝나면 done(성공 여부, 성공한 단계)
 func bringToFront(_ pid: Int32, tag: String, steps: [String] = FOCUS_STEPS,
                   done: ((Bool, String?) -> Void)? = nil) {
-    guard let app = NSRunningApplication(processIdentifier: pid) else {
-        logLine("focus \(tag) pid=\(pid) no-such-app"); done?(false, nil); return
-    }
+    let app = lookupApp(pid, tag: tag)
+    if app == nil { logLine("focus \(tag) pid=\(pid) no-such-app → ae/sysevents") }
+    runFocusSteps(pid, app, tag: tag, steps[...], done: done)
+}
+
+func runFocusSteps(_ pid: Int32, _ app: NSRunningApplication?, tag: String, _ steps: ArraySlice<String>,
+                   done: ((Bool, String?) -> Void)?) {
     guard let step = steps.first else {
         logLine("focus \(tag) pid=\(pid) all-steps-failed"); done?(false, nil); return
     }
-    let ret = runFocusStep(step, app)
+    let ret = runFocusStep(step, pid: pid, app: app)
+    if ret.hasPrefix("skip") {
+        logLine("focus \(tag) pid=\(pid) step=\(step) ret=\(ret)")
+        runFocusSteps(pid, app, tag: tag, steps.dropFirst(), done: done); return
+    }
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
         let fp = frontPid()
         let ok = fp == pid
         logLine("focus \(tag) pid=\(pid) step=\(step) ret=\(ret) front=\(fp.map(String.init) ?? "nil") ok=\(ok)")
-        if ok { done?(true, step) } else { bringToFront(pid, tag: tag, steps: Array(steps.dropFirst()), done: done) }
+        if ok { done?(true, step) } else { runFocusSteps(pid, app, tag: tag, steps.dropFirst(), done: done) }
     }
 }
 
@@ -1177,21 +1232,25 @@ func focus(_ it: ListItem, done: ((Bool) -> Void)? = nil) {
     let tag = keyTag(it.key)
     if it.work { activateBundle("com.openai.codex", tag: tag, done: done); return }   // Codex Work → ChatGPT 앱
     // Claude 세션 / Codex CLI: 그 터미널 창 프로세스. 모르면 Ghostty 앱까지만
-    if let pid = it.termPid, let app = NSRunningApplication(processIdentifier: pid) {
-        guard app.bundleIdentifier == "com.mitchellh.ghostty", !it.matchNames.isEmpty else {
+    if let pid = it.termPid, let app = lookupApp(pid, tag: tag) {
+        guard app.bundleIdentifier == GHOSTTY_ID, !it.matchNames.isEmpty else {
             bringToFront(pid, tag: tag) { ok, _ in done?(ok) }; return
         }
-        // 그 Ghostty 프로세스 안에서 세션 창(터미널)을 먼저 고르고, 프로세스를 앞으로
+        // 그 Ghostty 프로세스 안에서 세션 창(터미널)을 먼저 고르고, 앱도 Apple Event 로 올린 뒤
+        // (같은 대상이라 이미 받은 "Ghostty 제어" 권한으로 충분) 프로세스 단위 체인으로 확인
         DispatchQueue.global(qos: .userInitiated).async {
             let pick = ghosttyFocus(pid: pid, names: it.matchNames)
+            var act: Int?
+            if case .focused = pick { act = aeActivate(pid) }
             DispatchQueue.main.async {
                 logLine("focus \(tag) ghostty-pick=\(pick)")
+                if let act { logLine("focus \(tag) pid=\(pid) step=ghostty-activate ret=\(act)") }
                 bringToFront(pid, tag: tag) { ok, _ in done?(ok) }
             }
         }
     } else {
         logLine("focus \(tag) term_pid=\(it.termPid.map(String.init) ?? "nil") → Ghostty app")
-        activateBundle("com.mitchellh.ghostty", tag: tag, done: done)
+        activateBundle(GHOSTTY_ID, tag: tag, done: done)
     }
 }
 
@@ -1227,7 +1286,7 @@ func requestFocusCLI(_ sid: String) -> Int32 {
     return result == true ? 0 : 1
 }
 
-// --test-focus <pid> [coop,all,sysevents]: 메뉴바 앱과 같은 accessory 앱으로 띄워 포커스 체인을 한 번 시험하고,
+// --test-focus <pid> [coop,all,ae,sysevents]: 메뉴바 앱과 같은 accessory 앱으로 띄워 포커스 체인을 한 번 시험하고,
 // 원래 맨 앞 앱으로 되돌린 뒤 끝낸다. 결과는 stderr(=로그).
 final class FocusTest: NSObject, NSApplicationDelegate {
     let pid: Int32
