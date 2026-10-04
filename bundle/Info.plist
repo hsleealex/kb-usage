@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- KbUsage.app/Contents/Info.plist 이자, 단독 실행 파일에도 박는 Info.plist
+     (swiftc ... -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker bundle/Info.plist).
+     실행 파일과 같은 폴더에 두면 codesign 이 그 폴더를 번들로 보고 봉인하므로 bundle/ 에 둔다.
+     메뉴바 앱은 번들(KbUsage.app)로 띄운다: 번들 없는 실행 파일은 macOS 가 자동화 권한을 경로로
+     기록하고, 예전에 팝업 없이 거부된 경로는 설정 화면에도 안 보여 되돌릴 방법이 없었다.
+     CFBundleIdentifier 는 defaults 도메인(kb-usage-menubar)과 같게 — iconVariant 설정이 그대로 읽힌다.
+     NSAppleEventsUsageDescription: 세션 행 클릭 시 그 Ghostty 창을 고르려면 "Ghostty 제어" 권한이 필요하고,
+     이 설명이 없으면 macOS 가 묻지 않고 거부할 수 있다. -->
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>kb-usage-menubar</string>
+  <key>CFBundleName</key><string>kb-usage</string>
+  <key>CFBundleExecutable</key><string>kb-usage-menubar</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>LSUIElement</key><true/>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>세션 목록에서 누른 세션의 Ghostty 창(탭)을 앞으로 가져오려고 Ghostty 에 창 목록을 묻고 그 창으로 초점을 옮깁니다.</string>
+</dict>
+</plist>

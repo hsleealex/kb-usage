@@ -107,6 +107,10 @@ def write_session(data, now):
 
     path = os.path.join(SESS_DIR, "%s.json" % sid)
 
+    # 에이전트 = output style 이름 (돌쇠/개똥이 …). default 면 null → 메뉴바가 "Claude"
+    style = (data.get("output_style") or {}).get("name")
+    agent = style if isinstance(style, str) and style and style != "default" else None
+
     # started_at 은 세션이 처음 등장한 시각. 메뉴바가 이걸로 **안정 정렬**한다
     # (updated_at 으로 정렬하면 세션들이 각자 갱신될 때마다 순서가 튄다).
     started = now
@@ -121,6 +125,7 @@ def write_session(data, now):
     rec = {
         "session_id": sid,
         "name": name,
+        "agent": agent,
         "model": (data.get("model") or {}).get("display_name"),
         "context_pct": ctx.get("used_percentage"),
         "context_tokens": ctx.get("total_input_tokens"),

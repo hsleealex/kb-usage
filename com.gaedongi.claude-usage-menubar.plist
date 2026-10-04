@@ -5,7 +5,7 @@
 <dict>
   <key>Label</key><string>com.gaedongi.claude-usage-menubar</string>
   <key>ProgramArguments</key>
-  <array><string>__BASE__/kb-usage-menubar</string></array>
+  <array><string>__BASE__/KbUsage.app/Contents/MacOS/kb-usage-menubar</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>__BASE__/menubar.log</string>

@@ -1,7 +1,12 @@
 kb-usage-menubar
+KbUsage.app/
+_CodeSignature/
 menubar.log
 model_usage.json
 rate_limits.json
+codex_limits.json
+codex_models_cache.json
+*.tmp
 sessions/
 __pycache__/
 *.pyc
