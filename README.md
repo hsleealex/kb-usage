@@ -32,6 +32,7 @@ XENEON EDGE 전용. → macOS + keyboard LCD 조합은 경로가 없어 메뉴�
 |---|---|
 | `menubar.swift` / `kb-usage-menubar` | 메뉴바 앱 (AppKit, 의존성 0). 빌드는 `./install.sh` (`Info.plist` 를 실행 파일에 박는다 — "Ghostty 제어" 권한 설명) |
 | `bundle/Info.plist` | `KbUsage.app` 의 Info.plist 이자 단독 실행 파일에 박는 plist: 번들 id `kb-usage-menubar`(= defaults 도메인), Apple Events 권한 설명 |
+| `bundle/AppIcon.icns` | `KbUsage.app` 앱 아이콘 (원본 `bundle/AppIcon-1024.png` → `sips` 로 iconset → `iconutil -c icns`) |
 | `statusline.py` | Claude Code statusLine 훅. `rate_limits` → `rate_limits.json`. `model_usage.py` 스폰 |
 | `rate_limits.json` | 최신 스냅샷 (`{rate_limits, captured_at}`) |
 | `model_usage.py` | 현재 5h창/주간창 구간 로그 → **모델별** 토큰·$ (`--print` / `--force`) |

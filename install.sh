@@ -23,9 +23,11 @@ sign "$BASE/kb-usage-menubar"       # 단독 실행 파일 — CLI 용 (--focus,
 # 메뉴바 앱은 번들로 띄운다 — 자동화 권한("Ghostty 제어")의 주체가 번들 id 하나로 모인다.
 # (번들 없는 실행 파일은 권한이 경로로 기록되고 설정 화면에서 관리가 안 된다)
 APP="$BASE/KbUsage.app"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BASE/bundle/Info.plist" "$APP/Contents/Info.plist"
 cp "$BASE/kb-usage-menubar" "$APP/Contents/MacOS/kb-usage-menubar"
+# 앱 아이콘 — 서명이 Resources 까지 봉인하므로 반드시 sign 앞에서 복사한다
+cp "$BASE/bundle/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 sign "$APP"
 
 # 2. plist 설치 (__BASE__ 치환)
