@@ -1286,6 +1286,90 @@ func requestFocusCLI(_ sid: String) -> Int32 {
     return result == true ? 0 : 1
 }
 
+// ── 작업 완료 배너 (알림 센터) ──────────────────────────
+// Stop 훅으로 세션이 working → idle 이 되면 App.sounds 가 조건을 보고 여기로 배너를 넘긴다.
+//
+// UNUserNotificationCenter 는 못 쓴다: 이 앱은 ad-hoc 서명이라 macOS 가 묻지도 않고
+// "Notifications are not allowed for this application"(UNErrorDomain 1) 로 거부한다
+// (launchd 직접 실행·open(LaunchServices) 둘 다, 2026-10-06 macOS 26.6 실측). Developer ID 서명이 있어야 한다.
+// 그래서 승인 알림 팝업과 같은 alerter(Developer ID 서명, 클릭 결과를 stdout 으로 돌려줌)를 쓰고,
+// 없으면 osascript display notification (이건 클릭해도 창 이동 불가 — 스크립트 편집기가 열린다).
+//   그룹 "kbdone-<sid>": 같은 세션의 다음 완료가 이전 배너를 대체한다 (세션당 한 장).
+//   클릭(@CONTENTCLICKED) → 그 세션 창으로 (행 클릭과 같은 focus()).
+//   doneBannerSeconds(기본 10)초 뒤 자동으로 닫힌다. 0 = 누를 때까지 남김.
+// 소리는 doneSound(NSSound) 가 따로 낸다 — 배너는 무음.
+let ALERTER_PATHS = ["~/.local/bin/alerter", "/opt/homebrew/bin/alerter", "/usr/local/bin/alerter"]
+    .map { ($0 as NSString).expandingTildeInPath }
+let APP_ICON_PNG = ("~/developer/kb-usage/bundle/AppIcon-1024.png" as NSString).expandingTildeInPath
+
+func fmtTook(_ secs: Double) -> String {
+    let s = max(0, Int(secs.rounded()))
+    if s < 60 { return "\(s)초" }
+    if s < 3600 { return s % 60 == 0 ? "\(s / 60)분" : "\(s / 60)분 \(s % 60)초" }
+    return "\(s / 3600)시간 \((s % 3600) / 60)분"
+}
+
+// 완료 알림을 낼지 (순수 함수). 반환 nil = 낸다, 아니면 안 내는 이유 (로그용)
+func doneNotifyDecision(enabled: Bool, took: Double, minMinutes: Double, front: Int32?, term: Int32?) -> String? {
+    if !enabled { return "off" }
+    if took < minMinutes * 60 { return "short" }
+    if let t = term, front == t { return "front" }
+    return nil
+}
+
+final class DoneBanner {
+    private var procs: [String: Process] = [:]     // sid → 떠 있는 alerter (같은 세션 새 배너면 이전 것 정리)
+
+    func post(sid: String, title: String, body: String, seconds: Int) {
+        let tag = keyTag("c:" + sid)
+        guard let alerter = ALERTER_PATHS.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            postOsascript(tag: tag, title: title, body: body); return
+        }
+        procs[sid]?.terminate()
+        var args = ["--title", title, "--message", body, "--group", "kbdone-" + sid,
+                    "--close-label", "닫기", "--timeout", String(max(0, seconds))]
+        if FileManager.default.fileExists(atPath: APP_ICON_PNG) { args += ["--app-icon", APP_ICON_PNG] }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: alerter)
+        p.arguments = args
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        p.standardInput = FileHandle.nullDevice
+        p.terminationHandler = { [weak self] proc in
+            let r = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            DispatchQueue.main.async {
+                if self?.procs[sid] === proc { self?.procs[sid] = nil }
+                logLine("done-banner result \(tag) \(r.isEmpty ? "(none)" : r) exit=\(proc.terminationStatus)")
+                guard r == "@CONTENTCLICKED" else { return }
+                guard let it = itemForSession(String(sid.prefix(64))) else { logLine("done-banner click no-session"); return }
+                focus(it)
+            }
+        }
+        do {
+            try p.run()
+            procs[sid] = p
+            logLine("done-banner post \(tag) via=alerter ok=true")
+        } catch {
+            logLine("done-banner post \(tag) via=alerter ok=false err=\((error as NSError).code)")
+            postOsascript(tag: tag, title: title, body: body)
+        }
+    }
+
+    // 폴백: 클릭해도 창 이동 안 됨. 문자열은 argv 로 넘겨 이스케이프 문제 없게
+    private func postOsascript(tag: String, title: String, body: String) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-e", "on run argv", "-e", "display notification (item 2 of argv) with title (item 1 of argv)",
+                       "-e", "end run", title, body]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        let ok = (try? p.run()) != nil
+        logLine("done-banner post \(tag) via=osascript ok=\(ok)")
+    }
+}
+
 // --test-focus <pid> [coop,all,ae,sysevents]: 메뉴바 앱과 같은 accessory 앱으로 띄워 포커스 체인을 한 번 시험하고,
 // 원래 맨 앞 앱으로 되돌린 뒤 끝낸다. 결과는 stderr(=로그).
 final class FocusTest: NSObject, NSApplicationDelegate {
@@ -1456,14 +1540,18 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     //   attentionSound          승인 대기에 **새로 들어가는 순간** 한 번 (기본 Glass, "" 이면 무음).
     //                           승인 알림 팝업은 kb-usage 가 커버하는 세션엔 안 뜨므로 소리는 여기서 낸다.
     //   attentionRepeatMinutes  N>0 이면 N분 넘게 이어질 때마다 다시 (기본 0 = 끔, 비권장)
-    //   doneNotify              Stop 때, 직전 작업이 doneNotifyMinMinutes(기본 3)분 이상이고
-    //                           그 세션 창이 맨 앞이 아니면 doneSound(기본 Tink) 1회
+    //   doneNotify              (기본 켜짐) Stop 때, 이번 턴이 doneNotifyMinMinutes(기본 1)분 이상이고
+    //                           그 세션 창이 맨 앞이 아니면 1회: doneSound(기본 Tink, "" = 무음)
+    //                           + doneBanner(기본 켜짐) 알림 배너 (클릭 = 그 세션 창, doneBannerSeconds 기본 10초 뒤 닫힘)
     let ud = UserDefaults.standard
     var repeatMin: Double { ud.double(forKey: "attentionRepeatMinutes") }
     var attnSound: String { ud.string(forKey: "attentionSound") ?? "Glass" }
-    var doneNotify: Bool { ud.bool(forKey: "doneNotify") }
-    var doneMin: Double { ud.object(forKey: "doneNotifyMinMinutes") == nil ? 3 : ud.double(forKey: "doneNotifyMinMinutes") }
+    var doneNotify: Bool { ud.object(forKey: "doneNotify") == nil ? true : ud.bool(forKey: "doneNotify") }
+    var doneBannerOn: Bool { ud.object(forKey: "doneBanner") == nil ? true : ud.bool(forKey: "doneBanner") }
+    var doneBannerSecs: Int { ud.object(forKey: "doneBannerSeconds") == nil ? 10 : ud.integer(forKey: "doneBannerSeconds") }
+    var doneMin: Double { ud.object(forKey: "doneNotifyMinMinutes") == nil ? 1 : ud.double(forKey: "doneNotifyMinMinutes") }
     var doneSound: String { ud.string(forKey: "doneSound") ?? "Tink" }
+    let banner = DoneBanner()
 
     var variant: String {
         let v = UserDefaults.standard.string(forKey: "iconVariant") ?? ICON_DEFAULT
@@ -1624,7 +1712,7 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         snd.play()                                                // 시스템 음량·무음 설정은 NSSound 가 따른다
     }
 
-    // 소리: 첫 승인 대기엔 안 낸다 (팝업이 Glass). 옵션 두 개는 기본 꺼짐.
+    // 소리: 승인 대기 진입 1회(기본 켜짐), 반복(기본 꺼짐), 작업 완료(기본 켜짐, 배너 포함).
     func sounds(_ s: Snap) {
         let now = Date().timeIntervalSince1970
         // (0) 승인 대기 진입 — 전이만. 앱 시작 때 이미 대기 중인 건 기준선으로만 (소리 X),
@@ -1651,20 +1739,44 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
             nudgedAt = nudgedAt.filter { k, _ in s.sessions.contains { "\($0.sid)@\(Int($0.stateSince ?? 0))" == k } }
         }
-        // (2) 오래 걸린 작업이 끝났는데 그 창을 안 보고 있을 때
+        // (2) 오래 걸린 작업이 끝났는데 그 창을 안 보고 있을 때 — 소리 + 배너
+        //     전이(working → idle)만 본다: 앱 시작 때 이미 끝나 있던 세션은 prevState 가 없어 안 알림,
+        //     같은 완료(done_at)는 doneSeen 으로 한 번만.
+        //     걸린 시간 = 턴 시작(idle → working/attention)부터 — 중간 승인 대기로 끊지 않는다.
         for r in s.sessions {
             let st = r.state ?? ""
-            if st == "working", prevState[r.sid] != "working" { workingSince[r.sid] = r.stateSince ?? now }
+            if st == "working" || st == "attention", workingSince[r.sid] == nil { workingSince[r.sid] = r.stateSince ?? now }
             if st == "idle", let done = r.doneAt, prevState[r.sid] == "working", doneSeen[r.sid] != done {
                 doneSeen[r.sid] = done
                 let took = done - (workingSince[r.sid] ?? done)
-                if doneNotify && took >= doneMin * 60 && frontPid() != r.termPid {
+                let front = frontPid()
+                let tag = keyTag("c:" + r.sid)
+                if let why = doneNotifyDecision(enabled: doneNotify, took: took, minMinutes: doneMin,
+                                                front: front, term: r.termPid) {
+                    logLine("done-skip \(tag) took=\(Int(took))s reason=\(why)")
+                } else {
                     play(doneSound)
-                    logLine("done-notify \(keyTag("c:" + r.sid)) took=\(Int(took))s")
+                    logLine("done-notify \(tag) took=\(Int(took))s sound=\(doneSound.isEmpty ? "(none)" : doneSound) banner=\(doneBannerOn)")
+                    if doneBannerOn { banner.post(sid: r.sid, title: doneTitle(r), body: doneBody(r, took: took), seconds: doneBannerSecs) }
                 }
             }
+            if st == "idle" { workingSince[r.sid] = nil }
             prevState[r.sid] = st
         }
+    }
+
+    // 배너 제목 = 세션 목록 행 제목과 같은 표기 ("개똥이  ·  세션 이름")
+    func doneTitle(_ r: SessionRow) -> String { "\(r.agent ?? "Claude")  ·  \(r.name)" }
+
+    // 배너 본문 = "작업 완료 · 3분 12초" + 있으면 한 줄 (todo 진행 / 마지막 도구)
+    func doneBody(_ r: SessionRow, took: Double) -> String {
+        var b = "작업 완료 · \(fmtTook(took))"
+        if let t = r.todoTotal, t > 0 {
+            b += "\n✓ \(r.todoDone ?? 0)/\(t)" + (r.todoActive.map { "  ·  \($0)" } ?? "")
+        } else if let tool = r.tool {
+            b += "\n마지막: " + tool + (r.hint.map { "  ·  \($0)" } ?? "")
+        }
+        return b
     }
 }
 
