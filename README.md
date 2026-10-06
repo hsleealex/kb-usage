@@ -210,35 +210,48 @@ defaults write kb-usage-menubar attentionSound Glass      # 진입 소리 ("" = 
 
 ## 작업 완료 알림
 
-세션이 일을 끝내면(Stop 훅 → working → idle) **소리 1회 + 알림 배너**. 기본 켜짐.
+세션이 일을 끝내면(Stop 훅 → working → idle) **승인 대기와 같은 방식으로** 알린다: 소리 1회 +
+메뉴바 점 + 팝오버 행 강조. 터미널 팝업·배너는 기본으로 안 띄운다.
 
 - **조건**: 이번 턴이 `doneNotifyMinMinutes`(기본 1분) 이상 걸렸고, 그 세션 터미널 창이 맨 앞이
   **아닐 때만** (보고 있는 창은 방해 안 함). 걸린 시간은 턴 시작(idle → working)부터 재고, 중간에
-  승인 대기가 끼어도 끊지 않는다.
-- **배너**: 제목 = 세션 목록 행과 같은 `에이전트 · 세션 이름`, 본문 = `작업 완료 · 3분 12초` +
-  있으면 한 줄 (todo `✓ 3/5 · 진행 항목` 또는 `마지막: Edit · menubar.swift`).
-  **클릭하면 그 세션의 Ghostty 창(탭)으로** — 세션 행 클릭과 같은 방식. 같은 세션의 다음 완료는
-  이전 배너를 대체하고(세션당 한 장), `doneBannerSeconds`(기본 10초) 뒤 저절로 닫힌다.
-- **중복·재시작**: 같은 완료는 한 번만. 앱이 (재)시작될 때 이미 끝나 있던 세션은 알리지 않는다
-  (전이만 본다).
-- **배너는 alerter 로 띄운다** (`~/.local/bin/alerter` · `/opt/homebrew/bin/alerter` 순, 승인 알림
-  팝업과 같은 도구). 앱 자체 알림(UNUserNotificationCenter)은 못 쓴다 — 이 앱은 ad-hoc 서명이라
-  macOS 가 묻지도 않고 거부한다(`UNErrorDomain 1`, macOS 26.6 실측). alerter 가 없으면
-  `osascript display notification` 으로 폴백하는데, 그건 **클릭해도 창으로 못 간다**.
-  배너가 안 보이면 시스템 설정 → 알림 → alerter 가 허용돼 있는지 확인.
+  승인 대기가 끼어도 끊지 않는다. 같은 완료는 한 번만, 앱이 (재)시작될 때 이미 끝나 있던 세션은
+  알리지 않는다 (전이만 본다).
+- **소리**: `doneSound`(기본 Tink) 1회.
+- **메뉴바 점**: 승인 점과 같은 자리·크기·펄스, 색만 **세이지**(다크 `#8fb89a`, 라이트 `#4f7a5c`
+  — 채도 낮은 회녹색이라 승인 호박·한도 장미·Claude 테라코타·Codex 시안과 안 헷갈린다).
+  **승인 대기가 하나라도 있으면 승인 점이 우선**이고, 승인이 풀리면 완료 점이 다시 보인다.
+  "동작 줄이기"면 펄스 없이 정적 점.
+- **팝오버 행**: 그 세션 행 아이콘이 세이지 체크 원(은은한 펄스), 상태 글자(`완료 후 2분`)가
+  세이지 굵게, 제목이 흐려지지 않는다. 목록 머리에 `N DONE`. 행 위치(정렬)는 안 바뀐다.
+- **사라지는 때** (확인한 걸로 본다):
+  - 그 세션 행을 클릭해 창으로 갔을 때
+  - 팝오버를 열었을 때 — 메뉴바 점은 바로 꺼지고, 행 강조는 팝오버를 닫을 때까지 남는다
+    (승인 대기의 "열면 펄스 정지"와 같은 방식)
+  - 그 세션 터미널 창이 맨 앞이 됐을 때 (승인 팝업 클릭으로 그 창에 간 경우 포함)
+  - 그 세션이 다시 working / 승인 대기가 됐을 때
+  - 세션이 종료됐을 때 (목록에서 빠짐)
+- **배너 (선택, 기본 꺼짐)**: `doneBanner` 를 켜면 위와 함께 alerter 배너도 띄운다. 제목 =
+  `에이전트 · 세션 이름`, 본문 = `작업 완료 · 3분 12초` + 있으면 한 줄 (todo 또는 마지막 도구),
+  클릭 = 그 세션 창, 같은 세션은 한 장으로 대체, `doneBannerSeconds`(기본 10초) 뒤 닫힘.
+  앱 자체 알림(UNUserNotificationCenter)은 못 쓴다 — ad-hoc 서명이라 macOS 가 묻지도 않고
+  거부한다(`UNErrorDomain 1`, macOS 26.6 실측). alerter(`~/.local/bin` · `/opt/homebrew/bin`)가
+  없으면 `osascript display notification` 으로 폴백하는데, 그건 클릭해도 창으로 못 간다.
 - Claude 세션만 해당. Codex 는 남의 프로세스(CLI·ChatGPT 앱)가 돌리는 스레드의 상태를
   app-server 가 주지 않아(`notLoaded`) 완료 시점을 알 수 없다.
 
 ```bash
-defaults write kb-usage-menubar doneNotify -bool NO          # 완료 알림 전부 끄기 (소리 + 배너)
-defaults write kb-usage-menubar doneBanner -bool NO          # 배너만 끄기 (소리는 유지)
+defaults write kb-usage-menubar doneNotify -bool NO          # 완료 알림 전부 끄기 (소리 + 점 + 배너)
+defaults write kb-usage-menubar doneDot -bool NO             # 메뉴바 점·행 강조 끄기 (기본 켜짐)
 defaults write kb-usage-menubar doneSound ""                 # 소리만 끄기 (기본 Tink)
 defaults write kb-usage-menubar doneNotifyMinMinutes 3       # 최소 작업 시간 (분, 기본 1)
+defaults write kb-usage-menubar doneBanner -bool YES         # alerter 배너도 띄우기 (기본 꺼짐)
 defaults write kb-usage-menubar doneBannerSeconds 0          # 배너 유지 시간 (초, 기본 10, 0 = 누를 때까지)
 ```
 
 설정은 다음 완료부터 바로 먹는다 (재시작 불필요). menubar.log 에 `done-notify` / `done-skip
-reason=short|front|off` / `done-banner post|result` 가 남는다.
+reason=short|front|off` / `dot attention|done|none` / `done-dot clear reason=click|popover|front|resumed|gone`
+(/ 배너를 켰으면 `done-banner post|result`) 가 남는다.
 
 ## 데이터 갱신
 

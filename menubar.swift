@@ -47,6 +47,8 @@ enum C {
     // 상태 색: 승인 필요 = 호박색 #ffad4d, 한도 95%+ = 장미색 #ff5d6c (ECHO 값)
     static let amber   = NSColor(srgbRed: 1.000, green: 0.678, blue: 0.302, alpha: 1)
     static let rose    = NSColor(srgbRed: 1.000, green: 0.365, blue: 0.424, alpha: 1)
+    // 작업 완료(아직 안 봄) = 세이지 #8fb89a — 채도 낮은 회녹색. 호박·장미·테라코타·시안 어느 쪽과도 색상각이 멀다
+    static let sage    = NSColor(srgbRed: 0.561, green: 0.722, blue: 0.604, alpha: 1)
     static let accent  = claude
 }
 
@@ -637,6 +639,7 @@ struct ListItem: Equatable {
     var termPid: Int32?               // 그 세션의 터미널(Ghostty) 창 프로세스
     var matchNames: [String] = []     // 그 프로세스 안에서 창을 고를 때 쓰는 세션 이름 후보 (터미널 제목)
     var work = false                  // Codex Work 묶음 행 (클릭 = ChatGPT 앱)
+    var done = false                  // 작업 완료 후 아직 안 봄 (세이지 체크 + 상태 글자 강조)
 }
 
 let ATTENTION_LABEL = ["permission_prompt": "승인 필요", "elicitation_dialog": "질문 대기",
@@ -657,7 +660,8 @@ func sortItems(_ items: [ListItem]) -> [ListItem] {
     }
 }
 
-func listItems(_ s: Snap, _ now: Double) -> [ListItem] {
+// done = 작업 완료 후 아직 안 본 세션 id (App.doneUnseen / doneShown) — 그 행을 강조
+func listItems(_ s: Snap, _ now: Double, done: Set<String> = []) -> [ListItem] {
     var out: [ListItem] = []
     for r in s.sessions {
         let st: RowState
@@ -701,7 +705,8 @@ func listItems(_ s: Snap, _ now: Double) -> [ListItem] {
                             status: status, progress: prog, right2: right2, right2Warn: warn,
                             ctxPct: ctx, rank: agentRank(r.agent),
                             startedAt: r.startedAt, attentionSince: r.stateSince ?? 0,
-                            termPid: r.termPid, matchNames: r.titles))
+                            termPid: r.termPid, matchNames: r.titles,
+                            done: st == .idle && done.contains(r.sid)))
     }
     // Codex CLI: **지금 떠 있는 codex CLI 프로세스**가 받칠 때만 (codex_usage.py 의 live —
     // 프로세스가 연 rollout 파일의 thread id 로 매칭). 최근 활동만으로는 안 띄운다.
@@ -746,7 +751,7 @@ let LIST_HEAD_H: CGFloat = 34
 final class StatusIcon: NSView {
     let shape = CAShapeLayer()
     let symbol = CALayer()
-    private(set) var current: (RowState, Bool)?
+    private(set) var current: (RowState, Bool, Bool)?     // (상태, codex, 완료 안 봄)
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -762,11 +767,21 @@ final class StatusIcon: NSView {
         guard window != nil, let c = current else { return }
         if c.0 == .attention && symbol.animation(forKey: "blink") == nil { symbol.add(blinkAnim(), forKey: "blink") }
         if c.0 == .working && shape.animation(forKey: "breathe") == nil { shape.add(breatheAnim(), forKey: "breathe") }
+        if c.2 && symbol.animation(forKey: "pulse") == nil { symbol.add(pulseAnim(), forKey: "pulse") }
     }
 
     func blinkAnim() -> CAAnimation {
         let a = CABasicAnimation(keyPath: "opacity")
         a.fromValue = 1.0; a.toValue = 0.15; a.duration = 0.75
+        a.autoreverses = true; a.repeatCount = .infinity
+        a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        a.isRemovedOnCompletion = false
+        return a
+    }
+    // 완료 체크: 메뉴바 점과 같은 느린 펄스 (승인 깜빡임보다 차분하게)
+    func pulseAnim() -> CAAnimation {
+        let a = CABasicAnimation(keyPath: "opacity")
+        a.fromValue = 1.0; a.toValue = 0.35; a.duration = 1.1
         a.autoreverses = true; a.repeatCount = .infinity
         a.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
         a.isRemovedOnCompletion = false
@@ -781,9 +796,9 @@ final class StatusIcon: NSView {
         return a
     }
 
-    func set(_ st: RowState, codex: Bool) {
-        if let c = current, c.0 == st, c.1 == codex { return }   // 같으면 그대로 (애니메이션 유지)
-        current = (st, codex)
+    func set(_ st: RowState, codex: Bool, done: Bool = false) {
+        if let c = current, c.0 == st, c.1 == codex, c.2 == done { return }   // 같으면 그대로 (애니메이션 유지)
+        current = (st, codex, done)
         shape.removeAllAnimations(); symbol.removeAllAnimations()
         shape.isHidden = false; symbol.isHidden = true
         let b = bounds
@@ -809,6 +824,17 @@ final class StatusIcon: NSView {
             shape.path = circle(8)
             shape.fillColor = tint.cgColor; shape.strokeColor = nil
             shape.add(breatheAnim(), forKey: "breathe")
+        case .idle where done:
+            // 완료 안 봄: 승인 삼각형과 같은 방식(심볼 레이어)으로, 모양은 체크 원
+            shape.isHidden = true; symbol.isHidden = false
+            symbol.frame = b
+            symbol.contentsGravity = .resizeAspect
+            let cfg = NSImage.SymbolConfiguration(pointSize: 12, weight: .bold)
+                .applying(.init(paletteColors: [C.bg, C.sage]))
+            symbol.contents = NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: nil)?
+                .withSymbolConfiguration(cfg)
+            symbol.contentsScale = window?.backingScaleFactor ?? 2
+            if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion { symbol.add(pulseAnim(), forKey: "pulse") }
         case .idle:
             shape.path = circle(7)
             shape.fillColor = nil; shape.strokeColor = C.faint.cgColor; shape.lineWidth = 1.2
@@ -832,7 +858,7 @@ final class SessionRowView: NSView {
         self.item = item
         super.init(frame: NSRect(x: 0, y: 0, width: width, height: ROW_H))
         addSubview(icon)
-        icon.set(item.state, codex: item.codex)
+        icon.set(item.state, codex: item.codex, done: item.done)
         addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
                                        owner: self, userInfo: nil))
     }
@@ -843,7 +869,7 @@ final class SessionRowView: NSView {
     func update(_ it: ListItem) -> Bool {
         if it == item { return false }
         item = it
-        icon.set(it.state, codex: it.codex)
+        icon.set(it.state, codex: it.codex, done: it.done)
         needsDisplay = true
         return true
     }
@@ -867,13 +893,13 @@ final class SessionRowView: NSView {
         let x0: CGFloat = 40
         let tint = item.codex ? C.cyan : C.claude
         let statusColor: NSColor = item.state == .attention ? C.amber
-            : (item.state == .working ? tint : C.faint)
-        let st = attr(item.status, 10, statusColor, weight: item.state == .attention ? .semibold : .regular)
+            : item.done ? C.sage : (item.state == .working ? tint : C.faint)
+        let st = attr(item.status, 10, statusColor, weight: item.state == .attention || item.done ? .semibold : .regular)
         let stW = st.size().width
         st.draw(at: NSPoint(x: bounds.width - padX - stW, y: 9))
         // 제목: 상태 글자 자리만큼 비우고 자른다
         let maxChars = max(8, Int((bounds.width - x0 - padX - stW - 10) / 7.2))
-        attr(clip(item.title, maxChars), 12, item.state == .idle || item.state == .unknown ? C.dim : C.text)
+        attr(clip(item.title, maxChars), 12, (item.state == .idle && !item.done) || item.state == .unknown ? C.dim : C.text)
             .draw(at: NSPoint(x: x0, y: 7))
         // 둘째 줄: 진행 상황 + 우측 컨텍스트
         let r2 = attr(item.right2, 10, item.right2Warn ? C.amber : C.faint)
@@ -949,16 +975,17 @@ final class PopoverView: NSView {
     }
     required init?(coder: NSCoder) { fatalError() }
 
-    func apply(_ s: Snap) {
+    func apply(_ s: Snap, done: Set<String> = []) {
         let now = Date().timeIntervalSince1970
         usage.snap = s
         let key = usage.contentKey(now)
         if key != usage.drawnKey { usage.drawnKey = key; usage.needsDisplay = true }
-        let items = listItems(s, now)
+        let items = listItems(s, now, done: done)
         let cnt = items.filter { !$0.codex }.count
         let att = items.filter { $0.state == .attention }.count
-        if cnt != head.count || att != head.attention {
-            head.count = cnt; head.attention = att; head.needsDisplay = true
+        let dn = items.filter { $0.done }.count
+        if cnt != head.count || att != head.attention || dn != head.done {
+            head.count = cnt; head.attention = att; head.done = dn; head.needsDisplay = true
         }
         if let h = list.apply(items) {
             if h != listH { listH = h; relayout() }
@@ -986,6 +1013,7 @@ final class PopoverView: NSView {
 final class ListHeadView: NSView {
     var count = -1
     var attention = 0
+    var done = 0
     override var isFlipped: Bool { true }
     override func draw(_ dirty: NSRect) {
         C.bg.setFill(); bounds.fill()
@@ -993,8 +1021,9 @@ final class ListHeadView: NSView {
         C.hair.setFill(); NSRect(x: padX, y: 2, width: bounds.width - 2 * padX, height: 1).fill()
         attr("SESSIONS", 11, C.dim, weight: .semibold, tracking: 1.6).draw(at: NSPoint(x: padX, y: 14))
         var right = "\(max(0, count)) LIVE"
+        if done > 0 { right = "\(done) DONE  ·  " + right }
         if attention > 0 { right = "\(attention) NEED YOU  ·  " + right }
-        let r = attr(right, 9, attention > 0 ? C.amber : C.faint, tracking: 0.6)
+        let r = attr(right, 9, attention > 0 ? C.amber : done > 0 ? C.sage : C.faint, tracking: 0.6)
         r.draw(at: NSPoint(x: bounds.width - padX - r.size().width, y: 15))
     }
 }
@@ -1317,6 +1346,15 @@ func doneNotifyDecision(enabled: Bool, took: Double, minMinutes: Double, front: 
     return nil
 }
 
+// 안 본 완료 표시(메뉴바 점 + 행 강조)를 지울 이유 (순수 함수). nil = 유지.
+// 팝오버를 연 것 / 행 클릭은 App 이 따로 지운다 (reason=popover / click).
+func doneClearReason(alive: Bool, state: String?, term: Int32?, front: Int32?) -> String? {
+    if !alive { return "gone" }                         // 세션 종료 (목록에서 빠짐)
+    if state != "idle" { return "resumed" }             // 다시 working / attention
+    if let t = term, front == t { return "front" }      // 그 창이 맨 앞 = 보고 있음
+    return nil
+}
+
 final class DoneBanner {
     private var procs: [String: Process] = [:]     // sid → 떠 있는 alerter (같은 세션 새 배너면 이전 것 정리)
 
@@ -1406,6 +1444,7 @@ struct IconData {
     var five: Double?; var seven: Double?; var stale = false
     var cxFive: Double?; var cxSeven: Double?; var cxDown = false
     var attention = false
+    var done = false                  // 안 본 작업 완료 — 승인 대기가 있으면 승인 점이 우선
     var drawDot = true                // 비교 시트용. 앱은 false (레이어 점)
 }
 let ATTN_DOT = NSPoint(x: 20, y: 16.6)       // 아이콘(40×20, y 위로) 안 승인 점 중심
@@ -1433,6 +1472,9 @@ func codexTint() -> NSColor {
 func attentionColor() -> NSColor {
     isDarkDrawing() ? C.amber : NSColor(srgbRed: 0.92, green: 0.62, blue: 0.0, alpha: 1)
 }
+// 완료 점: 다크 = 세이지, 라이트 = 같은 계열을 진하게 #4f7a5c
+let SAGE_LIGHT = NSColor(srgbRed: 0.310, green: 0.478, blue: 0.361, alpha: 1)
+func doneColor() -> NSColor { isDarkDrawing() ? C.sage : SAGE_LIGHT }
 
 let ICON_W: CGFloat = 40
 let ICON_VARIANTS = ["1", "2", "3"]
@@ -1492,12 +1534,12 @@ func drawIcon(_ v: String, _ d: IconData) {
 
     pair(NSPoint(x: 10, y: h / 2), d.five, d.seven, claudeTint(), off: d.stale)
     pair(NSPoint(x: 30, y: h / 2), d.cxFive, d.cxSeven, codexTint(), off: d.cxDown)
-    if d.attention && d.drawDot {
+    if (d.attention || d.done) && d.drawDot {
         // 두 링 사이 위. 바탕색 테두리를 둘러 링과 붙어 보이지 않게
         // (메뉴바 앱은 이 점을 이미지 대신 펄스되는 레이어로 그린다 — ATTN_DOT)
         let p = ATTN_DOT
         dot(p, 6.2, isDarkDrawing() ? NSColor.black.withAlphaComponent(0.55) : NSColor.white.withAlphaComponent(0.8))
-        dot(p, 4.6, attentionColor())
+        dot(p, 4.6, d.attention ? attentionColor() : doneColor())
     }
 }
 
@@ -1533,8 +1575,11 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var prevState: [String: String] = [:]
     var workingSince: [String: Double] = [:]
     var doneSeen: [String: Double] = [:]
+    var doneUnseen: [String: Double] = [:]   // 완료 알림을 냈고 아직 안 본 세션 (sid → done_at) — 메뉴바 점
+    var doneShown = Set<String>()            // 팝오버를 열어 본 완료 — 팝오버가 닫힐 때까지만 행 강조 유지
     var attnSeen: Set<String>?          // 지난 갱신 때의 승인 대기 키 (nil = 아직 기준선 없음)
     var lastAttnSound = 0.0
+    var dotKind = ""                    // 로그용: 지금 메뉴바 점 (attention / done / none)
 
     // ── 소리 (defaults) ──
     //   attentionSound          승인 대기에 **새로 들어가는 순간** 한 번 (기본 Glass, "" 이면 무음).
@@ -1542,12 +1587,15 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     //   attentionRepeatMinutes  N>0 이면 N분 넘게 이어질 때마다 다시 (기본 0 = 끔, 비권장)
     //   doneNotify              (기본 켜짐) Stop 때, 이번 턴이 doneNotifyMinMinutes(기본 1)분 이상이고
     //                           그 세션 창이 맨 앞이 아니면 1회: doneSound(기본 Tink, "" = 무음)
-    //                           + doneBanner(기본 켜짐) 알림 배너 (클릭 = 그 세션 창, doneBannerSeconds 기본 10초 뒤 닫힘)
+    //                           + doneDot(기본 켜짐) 메뉴바 세이지 점 펄스 + 팝오버 행 강조 (승인 대기와 같은 방식,
+    //                             승인 점이 우선). 그 행 클릭 / 팝오버 열기 / 그 창이 맨 앞 / 다시 작업 / 세션 종료 때 사라짐
+    //                           + doneBanner(기본 꺼짐) alerter 배너 (클릭 = 그 세션 창, doneBannerSeconds 기본 10초 뒤 닫힘)
     let ud = UserDefaults.standard
     var repeatMin: Double { ud.double(forKey: "attentionRepeatMinutes") }
     var attnSound: String { ud.string(forKey: "attentionSound") ?? "Glass" }
     var doneNotify: Bool { ud.object(forKey: "doneNotify") == nil ? true : ud.bool(forKey: "doneNotify") }
-    var doneBannerOn: Bool { ud.object(forKey: "doneBanner") == nil ? true : ud.bool(forKey: "doneBanner") }
+    var doneBannerOn: Bool { ud.object(forKey: "doneBanner") == nil ? false : ud.bool(forKey: "doneBanner") }
+    var doneDotOn: Bool { ud.object(forKey: "doneDot") == nil ? true : ud.bool(forKey: "doneDot") }
     var doneBannerSecs: Int { ud.object(forKey: "doneBannerSeconds") == nil ? 10 : ud.integer(forKey: "doneBannerSeconds") }
     var doneMin: Double { ud.object(forKey: "doneNotifyMinMinutes") == nil ? 1 : ud.double(forKey: "doneNotifyMinMinutes") }
     var doneSound: String { ud.string(forKey: "doneSound") ?? "Tink" }
@@ -1590,6 +1638,7 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
 
         view.list.onClick = { [weak self] it in
+            if !it.codex, it.key.hasPrefix("c:") { self?.clearDone(String(it.key.dropFirst(2)), reason: "click") }
             self?.popover.performClose(nil)
             DispatchQueue.main.async { focus(it) }   // 팝오버가 닫힌 뒤에
         }
@@ -1628,6 +1677,7 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // 바깥 클릭으로 닫혀도(transient) 1초 타이머를 끈다
     func popoverDidClose(_ n: Notification) {
         fastTimer?.invalidate(); fastTimer = nil
+        doneShown.removeAll()                    // 열어서 본 완료 강조는 닫으면 끝
     }
 
     @objc func toggle() {
@@ -1637,8 +1687,9 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         } else {
             let snap = readSnap()
             acked.formUnion(attentionKeys(snap))     // 팝오버로 봤으니 지금 대기들은 펄스 정지
+            seeDoneInPopover()                       // 완료도 본 것으로 → 메뉴바 점 끔, 행 강조는 닫을 때까지
             updateAttentionDot(snap)
-            view.apply(snap)
+            view.apply(snap, done: doneShown)
             popover.contentSize = view.totalSize
             popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
@@ -1653,11 +1704,12 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func refresh() {
         let s = readSnap()
-        if popover.isShown { view.apply(s) }      // 닫혀 있을 땐 아이콘만
+        sounds(s)                                  // 완료 감지 → doneUnseen
+        pruneDone(s)
+        if popover.isShown { seeDoneInPopover(); view.apply(s, done: doneShown) }   // 닫혀 있을 땐 아이콘만
         var d = iconData(s, Date().timeIntervalSince1970)
         d.drawDot = false                          // 점은 레이어로
         updateAttentionDot(s)
-        sounds(s)
         // 아이콘도 값이 같으면 다시 안 만든다
         let key = "\(variant)|\(d.five ?? -1)|\(d.seven ?? -1)|\(d.stale)|\(d.cxFive ?? -1)|\(d.cxSeven ?? -1)|\(d.cxDown)|\(d.attention)"
         if key != lastIcon {
@@ -1674,18 +1726,24 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     // 승인 대기 있으면 점. 아직 안 본 대기가 있으면 은은한 펄스 (동작 줄이기면 정적).
     // 팝오버를 열면 그때의 대기들은 본 것으로 → 정지. 새 대기가 오면 다시 펄스.
+    // 승인 대기가 없고 안 본 작업 완료가 있으면 같은 자리·같은 펄스로 세이지 점 (승인이 우선).
     func updateAttentionDot(_ s: Snap) {
         guard let b = item.button else { return }
         let keys = attentionKeys(s)
         acked.formIntersection(keys)
-        let show = !keys.isEmpty
-        let pulse = show && !keys.subtracting(acked).isEmpty && !popover.isShown
+        let attn = !keys.isEmpty
+        let done = !attn && !doneUnseen.isEmpty && !popover.isShown
+        let show = attn || done
+        let pulse = (attn ? !keys.subtracting(acked).isEmpty && !popover.isShown : done)
             && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let kind = attn ? "attention" : done ? "done" : "none"
+        if kind != dotKind { logLine("dot \(kind)" + (done ? " \(doneUnseen.keys.map { keyTag("c:" + $0) }.sorted().joined(separator: ","))" : "")); dotKind = kind }
         CATransaction.begin(); CATransaction.setDisableActions(true)
         attnDot.isHidden = !show
         if show {
             let dark = b.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            attnDot.backgroundColor = (dark ? C.amber : NSColor(srgbRed: 0.92, green: 0.62, blue: 0.0, alpha: 1)).cgColor
+            attnDot.backgroundColor = (attn ? (dark ? C.amber : NSColor(srgbRed: 0.92, green: 0.62, blue: 0.0, alpha: 1))
+                                            : (dark ? C.sage : SAGE_LIGHT)).cgColor
             attnDot.borderColor = (dark ? NSColor.black.withAlphaComponent(0.55) : NSColor.white.withAlphaComponent(0.8)).cgColor
             // 버튼 안에서 아이콘(ICON_W×20)은 가운데 정렬 — 아이콘 안 ATTN_DOT 위치로
             let ox = (b.bounds.width - ICON_W) / 2, oy = (b.bounds.height - 20) / 2
@@ -1756,13 +1814,41 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     logLine("done-skip \(tag) took=\(Int(took))s reason=\(why)")
                 } else {
                     play(doneSound)
-                    logLine("done-notify \(tag) took=\(Int(took))s sound=\(doneSound.isEmpty ? "(none)" : doneSound) banner=\(doneBannerOn)")
+                    logLine("done-notify \(tag) took=\(Int(took))s sound=\(doneSound.isEmpty ? "(none)" : doneSound) dot=\(doneDotOn) banner=\(doneBannerOn)")
+                    if doneDotOn { doneUnseen[r.sid] = done }
                     if doneBannerOn { banner.post(sid: r.sid, title: doneTitle(r), body: doneBody(r, took: took), seconds: doneBannerSecs) }
                 }
             }
             if st == "idle" { workingSince[r.sid] = nil }
             prevState[r.sid] = st
         }
+    }
+
+    // 안 본 완료 정리: 세션 종료 / 다시 작업 / 그 창이 맨 앞 (doneClearReason)
+    func pruneDone(_ s: Snap) {
+        guard !doneUnseen.isEmpty || !doneShown.isEmpty else { return }
+        let front = frontPid()
+        let bySid = Dictionary(s.sessions.map { ($0.sid, $0) }, uniquingKeysWith: { a, _ in a })
+        for sid in Set(doneUnseen.keys).union(doneShown) {
+            let r = bySid[sid]
+            if let why = doneClearReason(alive: r != nil, state: r?.state, term: r?.termPid, front: front) {
+                clearDone(sid, reason: why)
+            }
+        }
+    }
+
+    func clearDone(_ sid: String, reason: String) {
+        let had = doneUnseen.removeValue(forKey: sid) != nil
+        let shown = doneShown.remove(sid) != nil
+        if had || shown { logLine("done-dot clear \(keyTag("c:" + sid)) reason=\(reason)") }
+    }
+
+    // 팝오버가 열려 있으면 완료는 본 것: 메뉴바 점에서 빼고 행 강조는 닫힐 때까지 유지
+    func seeDoneInPopover() {
+        guard !doneUnseen.isEmpty else { return }
+        for sid in doneUnseen.keys.sorted() { logLine("done-dot clear \(keyTag("c:" + sid)) reason=popover") }
+        doneShown.formUnion(doneUnseen.keys)
+        doneUnseen.removeAll()
     }
 
     // 배너 제목 = 세션 목록 행 제목과 같은 표기 ("개똥이  ·  세션 이름")
@@ -1786,6 +1872,7 @@ func renderIconSheet(_ out: String) {
     let samples: [(String, IconData)] = [
         ("normal", IconData(five: 16, seven: 4, cxFive: 24, cxSeven: 4)),
         ("attention", IconData(five: 41, seven: 22, cxFive: 55, cxSeven: 18, attention: true)),
+        ("done", IconData(five: 41, seven: 22, cxFive: 55, cxSeven: 18, done: true)),
         ("near 80%+", IconData(five: 86, seven: 40, cxFive: 83, cxSeven: 30)),
         ("95%+", IconData(five: 97, seven: 60, cxFive: 45, cxSeven: 96)),
         ("codex down", IconData(five: 16, seven: 4, cxFive: nil, cxSeven: nil, cxDown: true)),
