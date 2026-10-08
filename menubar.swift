@@ -31,6 +31,17 @@ let POPOVER_TICK = 1.0        // 팝오버 열려있을 때 (카운트다운 부
 let STALE_SECONDS = 1800.0
 let CODEX_SECONDS = 60.0      // codex_usage.py --daemon 조회 주기 (같은 값 유지)
 let LIST_MAX_H: CGFloat = 330       // 세션 목록 최대 높이 — 넘으면 스크롤
+// Codex live(지금 떠 있는 CLI) 를 믿는 최대 나이. 데몬은 바뀔 때 + 20초마다 쓰지만, 10초 틱 간격과
+// 한도 조회 중 멈춤(요청 타임아웃 15초 ×2 + 모델 집계)이 겹치면 60초 넘게 벌어질 수 있다.
+// 넉넉히 잡아도 죽은 프로세스는 행마다 pid+시작 시각(sameProcess)으로 다시 걸러진다.
+let CODEX_LIVE_MAX_AGE = 90.0
+let CODEX_START_TIMEOUT = 45.0      // 앱 시작 후 이 시간까지 codex_limits.json 첫 기록이 없으면 STARTING 대신 이유
+let POPOVER_CHROME: CGFloat = 28    // 팝오버 화살표·테두리·화면 끝 여백 — 표시 화면 가용 높이에서 뺀다
+let POPOVER_MIN_H: CGFloat = 160
+let ATTN_BAR_H: CGFloat = 30        // 높이 제한에 걸렸을 때 위에 고정하는 승인 요약 줄
+
+// "동작 줄이기" — 모든 애니메이션 경로가 이걸 본다
+func reduceMotion() -> Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
 
 // ── 팔레트 (위젯과 동일) ──────────────────────────────
 enum C {
@@ -60,9 +71,12 @@ struct CodexThread {
 }
 struct CodexLive { var threadId: String; var pid: Int32; var startedAt: Double?; var termPid: Int32? }
 struct ModelShare { var label: String; var share: Double; var other: Bool }
+enum CodexFileState { case missing, unreadable, ok }
 struct CodexSnap {
     var five = CodexWin(); var seven = CodexWin()
     var plan: String?
+    var file = CodexFileState.missing // codex_limits.json 자체를 읽었나
+    var error: String?                // 데몬이 남긴 마지막 실패 사유 (짧게)
     var ok = false                    // 마지막 app-server 조회 성공 여부
     var checkedAt: Double?            // 마지막 조회 시도
     var capturedAt: Double?           // 마지막 성공 (값의 기준 시각)
@@ -72,6 +86,7 @@ struct CodexSnap {
     var models: [ModelShare]?         // 이번 주(한도 창) 모델별 토큰 비중, nil = 아직 집계 전
     var hasData: Bool { five.pct != nil || seven.pct != nil }
 }
+struct CodexDaemonInfo { var appStartedAt: Double; var scriptExists: Bool; var running: Bool?; var exitStatus: Int32? }
 struct ModelRow { var id: String; var label: String; var tokens: Double; var cost: Double }
 struct SessionRow {
     var name: String; var agent: String?; var model: String?
@@ -95,6 +110,7 @@ struct Snap {
     var sessions: [SessionRow] = []   // 살아있고 창이 있는 Claude 세션 전부
     var hiddenNoWindow: [String] = [] // 살아있지만 터미널 창이 없어 숨긴 세션 id (tmux 헤드리스 등)
     var codex = CodexSnap()           // codex_limits.json
+    var codexDaemon: CodexDaemonInfo? // App 이 채운다 (STARTING 시간 제한·실패 이유용). nil = 모름
     var chatgptRunning = false        // ChatGPT 앱 (Codex Work) 프로세스가 떠 있나
     var attention: Bool { sessions.contains { $0.state == "attention" } }
 }
@@ -108,7 +124,10 @@ func readJSON(_ path: String) -> [String: Any]? {
 // 없거나 깨지면 빈 값.
 func readCodex() -> CodexSnap {
     var c = CodexSnap()
-    guard let root = readJSON(CX_PATH) else { return c }
+    guard let d = FileManager.default.contents(atPath: CX_PATH) else { c.file = .missing; return c }
+    guard let root = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any] else { c.file = .unreadable; return c }
+    c.file = .ok
+    c.error = root["error"] as? String
     c.ok = (root["ok"] as? Bool) ?? false
     c.checkedAt = root["checked_at"] as? Double
     c.capturedAt = root["captured_at"] as? Double
@@ -406,6 +425,42 @@ func groupShares(_ rows: [ShareRow]) -> [ShareRow] {
 }
 func pctText(_ share: Double) -> String { "\(Int((share * 100).rounded()))%" }
 
+// 종량 과금 모델(페이블 등)의 이번 주 실제 청구액 — 비중 % 열과 섞지 않고 note 줄로. 없으면 nil
+func meteredCostNote(_ rows: [ModelRow]) -> String? {
+    let m = rows.filter { $0.id.hasPrefix("claude-fable") && $0.cost >= 0.5 }
+    guard !m.isEmpty else { return nil }
+    return "종량 청구 · " + m.map { "\(clip($0.label, 14)) " + String(format: "$%.0f", $0.cost) }.joined(separator: ", ")
+}
+
+// ── 접근성 문구 (순수 함수) ──
+func windowLabelKo(_ l: String) -> String {
+    switch l { case "WEEKLY": return "주간"; case "5H": return "5시간"; default: return l }
+}
+func limitAccessibilityValue(_ l: LimitLine) -> String {
+    var parts = [l.pct.map { "\(Int($0.rounded()))% 사용" } ?? "값 없음"]
+    if l.resetDone { parts.append("마지막 조회 이후 리셋됨") } else if let r = l.reset { parts.append(r) }
+    if let e = l.eta { parts.append(e) }
+    return parts.joined(separator: ", ")
+}
+func modelAccessibilityValue(_ rows: [ShareRow], empty: String?, note: String?) -> String {
+    var s = rows.isEmpty ? (empty ?? "기록 없음") : rows.map { "\($0.label) \(pctText($0.share))" }.joined(separator: ", ")
+    if let n = note { s += ". " + n }
+    return s
+}
+
+// Codex 첫 기록 전 꼬리말: 시간 제한 안이면 STARTING + 경과초, 넘거나 원인이 보이면 이유. (문구, 경고)
+func codexStartingFoot(_ file: CodexFileState, _ d: CodexDaemonInfo?, _ now: Double) -> (String, Bool) {
+    if let d, !d.scriptExists { return ("NO DATA — codex_usage.py 없음", true) }
+    if file == .unreadable { return ("NO DATA — codex_limits.json 읽기 실패", true) }
+    if let d, d.running == false {
+        return ("NO DATA — 수집 데몬 종료" + (d.exitStatus.map { " (exit \($0))" } ?? "") + " · menubar.log 확인", true)
+    }
+    guard let d else { return ("STARTING…", false) }
+    let el = max(0, now - d.appStartedAt)
+    if el < CODEX_START_TIMEOUT { return ("STARTING… \(Int(el))S", false) }
+    return ("NO DATA — \(Int(el))초째 첫 기록 없음 · menubar.log 확인", true)
+}
+
 // ── 팝오버 위쪽: 한도 ─────────────────────────────────
 // Claude 와 Codex 를 **같은 컴포넌트**(limitBlock)로 그린다:
 //   서비스 이름 헤더(서비스 색) + 우측 플랜/경고
@@ -430,6 +485,9 @@ final class UsageView: NSView {
     var onHeightChange: ((CGFloat) -> Void)?
     var drawnKey = ""                 // 마지막으로 그린 내용 — 같으면 다시 안 그린다
     override var isFlipped: Bool { true }
+    override func isAccessibilityElement() -> Bool { true }
+    override func accessibilityRole() -> NSAccessibility.Role? { .group }
+    override func accessibilityLabel() -> String? { "사용 한도" }
 
     func rightText(_ s: NSAttributedString, _ y: CGFloat, _ padX: CGFloat) {
         s.draw(at: NSPoint(x: bounds.width - padX - s.size().width, y: y))
@@ -492,10 +550,35 @@ final class UsageView: NSView {
     func codexFoot(_ now: Double) -> (String, Bool) {
         let cx = snap.codex
         guard let c = cx.capturedAt else {
-            return (cx.checkedAt == nil ? "STARTING…" : "NO DATA — CODEX APP-SERVER UNAVAILABLE", cx.checkedAt != nil)
+            if cx.checkedAt == nil { return codexStartingFoot(cx.file, snap.codexDaemon, now) }
+            return ("NO DATA — " + (cx.error.map { "APP-SERVER: " + clip($0, 34) } ?? "CODEX APP-SERVER UNAVAILABLE"), true)
         }
         let down = codexUnavailable(cx, now)
         return ((down ? "LAST OK " : "UPDATED ") + fmtAgo(now - c).uppercased(), down)
+    }
+
+    // 접근성 요소 (직접 그리는 뷰라 draw 에서 위치를 모아 만든다). VoiceOver 가 읽는 값만, 그림 없음.
+    var axItems: [(role: NSAccessibility.Role, label: String, value: String, pct: Double?, rect: NSRect)] = []
+    var axKey = ""
+    func rebuildAccessibility() {
+        let key = axItems.map { "\($0.label)|\($0.value)|\(Int($0.rect.minY))" }.joined(separator: "#")
+        if key == axKey { return }
+        axKey = key
+        setAccessibilityChildren(axItems.map { it -> NSAccessibilityElement in
+            let e = NSAccessibilityElement()
+            e.setAccessibilityRole(it.role)
+            e.setAccessibilityParent(self)
+            e.setAccessibilityFrameInParentSpace(it.rect)
+            e.setAccessibilityLabel(it.label)
+            if let p = it.pct {
+                e.setAccessibilityValue(NSNumber(value: p))
+                e.setAccessibilityMinValue(NSNumber(value: 0)); e.setAccessibilityMaxValue(NSNumber(value: 100))
+                e.setAccessibilityValueDescription(it.value)
+            } else {
+                e.setAccessibilityValue(it.value)
+            }
+            return e
+        })
     }
 
     override func draw(_ dirty: NSRect) {
@@ -505,6 +588,10 @@ final class UsageView: NSView {
         let gW = bounds.width - 2 * padX
         var y: CGFloat = 18
         let (claudeLines, codexLines) = lines(now)
+        axItems = []
+        func ax(_ role: NSAccessibility.Role, _ label: String, _ value: String, pct: Double? = nil, _ y0: CGFloat, _ y1: CGFloat) {
+            axItems.append((role, label, value, pct, NSRect(x: padX, y: y0, width: gW, height: max(1, y1 - y0))))
+        }
 
         func limitBlock(_ name: String, _ color: NSColor, right: String?, rightWarn: Bool,
                         _ ls: [LimitLine], dimmed: Bool, foot: (String, Bool), extra: (() -> Void)?) {
@@ -512,9 +599,11 @@ final class UsageView: NSView {
             if let r = right, !r.isEmpty {
                 rightText(attr(r, 9, rightWarn ? C.amber : C.faint, tracking: 0.8), y + 1, padX)
             }
+            ax(.staticText, name, [name, right ?? ""].filter { !$0.isEmpty }.joined(separator: ", "), y, y + 16)
             y += 22
             for (i, l) in ls.enumerated() {
                 if i > 0 { y += 8 }
+                let y0 = y
                 attr(l.label, 10, C.dim, weight: .medium, tracking: 1.4).draw(at: NSPoint(x: padX, y: y))
                 if l.resetDone {
                     rightText(attr("reset since last check", 11, C.faint), y - 1, padX)
@@ -536,23 +625,29 @@ final class UsageView: NSView {
                     attr(e, 10, l.etaUrgent ? color : C.faint, tracking: 0.2).draw(at: NSPoint(x: gx, y: y - 8))
                     y += 8
                 }
+                ax(.progressIndicator, "\(name) \(windowLabelKo(l.label)) 한도", limitAccessibilityValue(l),
+                   pct: l.pct, y0, y)
             }
             if ls.isEmpty {
                 attr("no data", 11, C.dim).draw(at: NSPoint(x: padX, y: y))
+                ax(.staticText, "\(name) 한도", "데이터 없음", y, y + 16)
                 y += 18
             }
             extra?()
             y += 6
             attr(foot.0, 9, foot.1 ? C.amber : C.dim, tracking: 0.8).draw(at: NSPoint(x: padX, y: y))
+            ax(.staticText, "\(name) 갱신 상태", foot.0, y, y + 12)
             y += 14
         }
 
-        // BY MODEL / WEEK — Claude·Codex 공용 하위 블록 (같은 줄 높이·막대·SHARE 표기)
-        func modelBlock(_ rows: [(label: String, share: Double, right: String)], _ color: NSColor,
+        // BY MODEL — Claude·Codex 공용 하위 블록 (같은 줄 높이·막대). 오른쪽 열은 항상 주간 토큰 비중 %.
+        // 비용($)은 같은 열에 섞지 않고 아래 note 줄로 따로.
+        func modelBlock(_ service: String, _ rows: [ShareRow], _ color: NSColor,
                         empty: String?, note: String?) {
             y += 10
-            attr("BY MODEL / WEEK", 9, C.dim, weight: .medium, tracking: 1.4).draw(at: NSPoint(x: padX, y: y))
-            rightText(attr("SHARE", 9, C.faint, tracking: 0.6), y, padX)
+            let y0 = y
+            attr("BY MODEL", 9, C.dim, weight: .medium, tracking: 1.4).draw(at: NSPoint(x: padX, y: y))
+            rightText(attr("주간 토큰 비중", 9, C.faint, tracking: 0.6), y, padX)
             y += 16
             if rows.isEmpty, let e = empty {
                 attr(e, 10, C.faint).draw(at: NSPoint(x: padX, y: y))
@@ -562,13 +657,15 @@ final class UsageView: NSView {
                 attr(clip(row.label, 14), 11, C.text).draw(at: NSPoint(x: padX, y: y))
                 let barX = padX + 92
                 gauge(row.share, NSRect(x: barX, y: y + 4, width: gW - 92 - 40, height: 4), color.withAlphaComponent(0.8))
-                rightText(attr(row.right, 10, C.dim), y + 1, padX)
+                rightText(attr(pctText(row.share), 10, C.dim), y + 1, padX)
                 y += 17
             }
             if let n = note {
                 attr(n, 9, C.faint, tracking: 0.2).draw(at: NSPoint(x: padX, y: y))
                 y += 13
             }
+            ax(.staticText, "\(service) 모델별 주간 토큰 비중",
+               modelAccessibilityValue(rows, empty: empty, note: note), y0, y)
         }
 
         // ── CLAUDE ──
@@ -578,13 +675,9 @@ final class UsageView: NSView {
             // Claude 구역 안의 하위 블록: 주간 모델별 (model_usage.json)
             guard !self.snap.weekly.isEmpty else { return }
             let totTok = max(1, self.snap.weekly.reduce(0.0) { $0 + $1.tokens })
-            // 소넷·오퍼스는 Max 구독이라 $ 가 가상치 → share % 만. 종량 과금(페이블 등)만 실제 청구액
-            let grouped = groupShares(self.snap.weekly.map { r in
-                ShareRow(label: r.label, share: r.tokens / totTok,
-                         right: r.id.hasPrefix("claude-fable") ? String(format: "$%.0f", r.cost) : nil)
-            })
-            modelBlock(grouped.map { ($0.label, $0.share, $0.right ?? pctText($0.share)) },
-                       C.claude, empty: nil, note: nil)
+            let grouped = groupShares(self.snap.weekly.map { ShareRow(label: $0.label, share: $0.tokens / totTok) })
+            // 소넷·오퍼스는 Max 구독이라 $ 가 가상치 → 비중만. 종량 과금(페이블 등)만 실제 청구액을 note 줄로
+            modelBlock("CLAUDE", grouped, C.claude, empty: nil, note: meteredCostNote(self.snap.weekly))
         }
 
         // ── CODEX ── (codex_usage.py --daemon 이 app-server 에 60초마다 물어본 계정 단위 값)
@@ -598,11 +691,12 @@ final class UsageView: NSView {
             // 아직 집계 전이면 "집계 중" — 값을 지어내지 않는다.
             let ms = self.snap.codex.models
             let grouped = groupShares((ms ?? []).map { ShareRow(label: $0.label, share: $0.share, other: $0.other) })
-            modelBlock(grouped.map { ($0.label, $0.share, pctText($0.share)) }, C.cyan,
+            modelBlock("CODEX", grouped, C.cyan,
                        empty: ms == nil ? "집계 중…" : "이번 주 이 Mac 기록 없음",
                        note: ms == nil ? nil : "이 Mac 기준 · Windows·ephemeral 호출은 안 잡힘")
         }
         y += 4
+        rebuildAccessibility()
 
         // ── 높이 확정 ──
         // 동기 호출: 콜백이 팝오버 크기를 바로 맞춘다. 커진 뒤 재draw 때는
@@ -640,10 +734,29 @@ struct ListItem: Equatable {
     var matchNames: [String] = []     // 그 프로세스 안에서 창을 고를 때 쓰는 세션 이름 후보 (터미널 제목)
     var work = false                  // Codex Work 묶음 행 (클릭 = ChatGPT 앱)
     var done = false                  // 작업 완료 후 아직 안 봄 (세이지 체크 + 상태 글자 강조)
+    var note = ""                     // 셋째 줄 (게이지 없는 행만): Codex 상태 확인 불가 안내
 }
 
 let ATTENTION_LABEL = ["permission_prompt": "승인 필요", "elicitation_dialog": "질문 대기",
                        "agent_needs_input": "입력 대기"]
+
+// ── Codex 행 상태 ──
+// 승인 대기·idle 을 믿을 만하게 얻을 곳이 없다 (2026-10-07 조사):
+//   - app-server 의 thread status(active + activeFlags: waitingOnApproval)는 **그 app-server 가
+//     직접 로드한 스레드**에만 채워진다. CLI·ChatGPT 앱 스레드는 남의 프로세스라 늘 notLoaded(→ null).
+//   - rollout 파일엔 승인 요청 이벤트가 안 남고, 상태 DB(threads 테이블)에도 그런 칸이 없다.
+//   - notify 훅은 턴 완료(agent-turn-complete)만 준다.
+// 그래서 상태를 지어내지 않고 "상태 확인 불가 · 승인 알림 미지원"을 행에 그대로 적는다.
+// (혹시 status 가 active 로 오면 작업 중으로만 — 그때도 승인 알림은 없다)
+let CODEX_NO_STATE = "상태 확인 불가 · 승인 알림 미지원"
+func codexRowState(_ status: String?) -> RowState { status == "active" ? .working : .unknown }
+func codexStateNote(_ st: RowState) -> String { st == .working ? "승인 알림 미지원" : CODEX_NO_STATE }
+
+// live(지금 떠 있는 codex CLI 목록)를 믿어도 되나 — 데몬 쓰기 간격보다 넉넉히
+func codexLiveFresh(_ liveAt: Double?, _ now: Double) -> Bool {
+    guard let t = liveAt else { return false }
+    return now - t <= CODEX_LIVE_MAX_AGE
+}
 
 func agentRank(_ agent: String?) -> Int {
     switch agent { case "돌쇠": return 0; case "개똥이": return 1; default: return 2 }
@@ -710,21 +823,22 @@ func listItems(_ s: Snap, _ now: Double, done: Set<String> = []) -> [ListItem] {
     }
     // Codex CLI: **지금 떠 있는 codex CLI 프로세스**가 받칠 때만 (codex_usage.py 의 live —
     // 프로세스가 연 rollout 파일의 thread id 로 매칭). 최근 활동만으로는 안 띄운다.
-    // 데몬이 멎어 live 가 30초+ 묵었으면 믿지 않는다. pid 도 여기서 한 번 더 확인.
+    // 데몬이 멎어 live 가 CODEX_LIVE_MAX_AGE 넘게 묵었으면 믿지 않는다. pid 도 여기서 한 번 더 확인.
     let byId = Dictionary(s.codex.threads.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-    let liveOK = s.codex.liveAt.map { now - $0 < 30 } ?? false
+    let liveOK = codexLiveFresh(s.codex.liveAt, now)
     // Claude 와 같은 기준: 프로세스가 살아있고 조상에 터미널 앱(창)이 있어야 한다
     for lv in (liveOK ? s.codex.live : []) where sameProcess(lv.pid, lv.startedAt) {
         guard let term = terminalAncestor(lv.pid) else { continue }
         let t = byId[lv.threadId]
         var prog = "CLI"
         if let m = t?.model { prog += "  ·  \(m)" }
-        let st: RowState = t?.status == "active" ? .working : .unknown
+        let st = codexRowState(t?.status)
         out.append(ListItem(key: "x:" + lv.threadId, codex: true, state: st,
                             title: "Codex  ·  \(t?.name ?? "CLI 세션")",
                             status: t?.updatedAt.map { "활동 \(fmtKo(now - $0)) 전" } ?? "실행 중",
                             progress: prog, right2: "", rank: 3,
-                            startedAt: t?.createdAt ?? lv.startedAt ?? 0, termPid: term))
+                            startedAt: t?.createdAt ?? lv.startedAt ?? 0, termPid: term,
+                            note: codexStateNote(st)))
     }
     // Codex Work: ChatGPT 앱이 떠 있을 때만 한 줄. 앱 스레드(source != cli)는 어차피 앱에
     // 들어가 눌러야 하므로 묶는다. 스레드 수는 최근 30분 활동 기준.
@@ -736,7 +850,7 @@ func listItems(_ s: Snap, _ now: Double, done: Set<String> = []) -> [ListItem] {
                             title: "Codex Work",
                             status: last.map { "활동 \(fmtKo(now - $0)) 전" } ?? "",
                             progress: n > 0 ? "ChatGPT 앱  ·  최근 30분 스레드 \(n)개" : "ChatGPT 앱",
-                            right2: "", rank: 4, startedAt: 0, work: true))
+                            right2: "", rank: 4, startedAt: 0, work: true, note: CODEX_NO_STATE))
     }
     return sortItems(out)
 }
@@ -758,16 +872,32 @@ final class StatusIcon: NSView {
         wantsLayer = true
         layer?.addSublayer(shape)
         layer?.addSublayer(symbol)
+        setAccessibilityElement(false)   // 장식 — 상태는 행의 접근성 문구가 말한다
     }
     required init?(coder: NSCoder) { fatalError() }
 
     // 창에서 떨어졌다 붙으면(팝오버 닫고 열기) 애니메이션이 빠져 있을 수 있다 — 없을 때만 다시
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        guard window != nil, let c = current else { return }
-        if c.0 == .attention && symbol.animation(forKey: "blink") == nil { symbol.add(blinkAnim(), forKey: "blink") }
-        if c.0 == .working && shape.animation(forKey: "breathe") == nil { shape.add(breatheAnim(), forKey: "breathe") }
-        if c.2 && symbol.animation(forKey: "pulse") == nil { symbol.add(pulseAnim(), forKey: "pulse") }
+        guard window != nil else { return }
+        applyMotion(restart: false)
+    }
+
+    // 지금 상태에 맞는 애니메이션만 건다. "동작 줄이기"면 전부 떼고 정적 모양만 (모든 경로가 여기로).
+    // restart=false 면 이미 붙어 있는 건 그대로 둔다 (위상이 튀지 않게).
+    func applyMotion(restart: Bool) {
+        guard let c = current else { return }
+        let motion = !reduceMotion()
+        func want(_ l: CALayer, _ key: String, _ on: Bool, _ make: () -> CAAnimation) {
+            if on && motion {
+                if restart || l.animation(forKey: key) == nil { l.removeAnimation(forKey: key); l.add(make(), forKey: key) }
+            } else if l.animation(forKey: key) != nil {
+                l.removeAnimation(forKey: key)
+            }
+        }
+        want(symbol, "blink", c.0 == .attention, blinkAnim)
+        want(shape, "breathe", c.0 == .working, breatheAnim)
+        want(symbol, "pulse", c.0 == .idle && c.2, pulseAnim)
     }
 
     func blinkAnim() -> CAAnimation {
@@ -819,11 +949,9 @@ final class StatusIcon: NSView {
             symbol.contents = NSImage(systemSymbolName: "exclamationmark.triangle.fill", accessibilityDescription: nil)?
                 .withSymbolConfiguration(cfg)
             symbol.contentsScale = window?.backingScaleFactor ?? 2
-            symbol.add(blinkAnim(), forKey: "blink")
         case .working:
             shape.path = circle(8)
             shape.fillColor = tint.cgColor; shape.strokeColor = nil
-            shape.add(breatheAnim(), forKey: "breathe")
         case .idle where done:
             // 완료 안 봄: 승인 삼각형과 같은 방식(심볼 레이어)으로, 모양은 체크 원
             shape.isHidden = true; symbol.isHidden = false
@@ -834,7 +962,6 @@ final class StatusIcon: NSView {
             symbol.contents = NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: nil)?
                 .withSymbolConfiguration(cfg)
             symbol.contentsScale = window?.backingScaleFactor ?? 2
-            if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion { symbol.add(pulseAnim(), forKey: "pulse") }
         case .idle:
             shape.path = circle(7)
             shape.fillColor = nil; shape.strokeColor = C.faint.cgColor; shape.lineWidth = 1.2
@@ -844,15 +971,59 @@ final class StatusIcon: NSView {
             shape.strokeColor = (codex ? C.cyan.withAlphaComponent(0.45) : C.faint).cgColor
             shape.lineDashPattern = codex ? [2, 2] : nil   // Codex: 상태 모름 = 점선 원
         }
+        applyMotion(restart: true)
     }
+}
+
+// 행 접근성 문구 (순수 함수): 라벨 = 제목 + 상태, 값 = 진행·컨텍스트·안내
+func rowStateWord(_ it: ListItem) -> String {
+    switch it.state {
+    case .attention: return ""                         // status 가 이미 "승인 필요 1분"
+    case .working: return "작업 중"
+    case .idle: return it.done ? "완료, 아직 안 봄" : "대기"
+    case .unknown: return it.codex ? "상태 확인 불가" : "상태 모름"
+    }
+}
+func rowAccessibility(_ it: ListItem) -> (label: String, value: String, help: String) {
+    let title = it.title.replacingOccurrences(of: "  ·  ", with: ", ")
+    let st = [rowStateWord(it), it.status].filter { !$0.isEmpty }.joined(separator: ", ")
+    let value = [it.progress.replacingOccurrences(of: "  ·  ", with: ", "), it.right2, it.note]
+        .filter { !$0.isEmpty }.joined(separator: ". ")
+    let help = it.work ? "누르면 ChatGPT 앱으로 이동" : "누르면 이 세션의 터미널 창으로 이동"
+    return (st.isEmpty ? title : "\(title) — \(st)", value, help)
 }
 
 final class SessionRowView: NSView {
     var item: ListItem
     let icon = StatusIcon(frame: NSRect(x: 18, y: 10, width: 14, height: 14))
     var onClick: ((ListItem) -> Void)?
+    var onMove: ((String, Int) -> Void)?   // 키보드 위/아래: (내 key, -1|+1)
     private var hovering = false
     override var isFlipped: Bool { true }
+
+    // ── 접근성: 버튼 하나 = 세션 하나 ──
+    override func isAccessibilityElement() -> Bool { true }
+    override func accessibilityRole() -> NSAccessibility.Role? { .button }
+    override func accessibilityLabel() -> String? { rowAccessibility(item).label }
+    override func accessibilityValue() -> Any? { rowAccessibility(item).value }
+    override func accessibilityHelp() -> String? { rowAccessibility(item).help }
+    override func accessibilityPerformPress() -> Bool { onClick?(item); return true }
+
+    // ── 키보드: ↑↓ 행 이동, Return/Enter/Space 누르기. 포커스 링은 시스템 것 ──
+    override var acceptsFirstResponder: Bool { true }
+    override var canBecomeKeyView: Bool { true }
+    override var focusRingMaskBounds: NSRect { bounds.insetBy(dx: 6, dy: 3) }
+    override func drawFocusRingMask() {
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 6, dy: 3), xRadius: 6, yRadius: 6).fill()
+    }
+    override func keyDown(with e: NSEvent) {
+        switch e.keyCode {
+        case 125: onMove?(item.key, 1)                        // ↓
+        case 126: onMove?(item.key, -1)                       // ↑
+        case 36, 76, 49: onClick?(item)                       // Return, Enter, Space
+        default: super.keyDown(with: e)
+        }
+    }
 
     init(_ item: ListItem, width: CGFloat) {
         self.item = item
@@ -912,6 +1083,9 @@ final class SessionRowView: NSView {
         if let p = item.ctxPct {
             gauge(p / 100, NSRect(x: x0, y: 41, width: bounds.width - x0 - padX, height: 3),
                   p >= 85 ? C.amber : tint.withAlphaComponent(0.75))
+        } else if !item.note.isEmpty {
+            // 게이지 자리(셋째 줄)에 안내 — Codex: 상태 확인 불가 · 승인 알림 미지원
+            attr(clip(item.note, 40), 9, C.faint).draw(at: NSPoint(x: x0, y: 37))
         }
         C.hair.setFill(); NSRect(x: x0, y: bounds.height - 1, width: bounds.width - x0 - padX, height: 1).fill()
     }
@@ -922,6 +1096,29 @@ final class SessionListView: NSView {
     var lastItems: [ListItem] = []
     var onClick: ((ListItem) -> Void)?
     override var isFlipped: Bool { true }
+
+    // 키보드: 팝오버를 열면 목록이 first responder. ↓ = 첫 행, ↑ = 끝 행부터 (그 뒤는 행이 받는다).
+    // 마우스로 열었을 때 포커스 링이 바로 뜨지 않게 행을 미리 고르지는 않는다.
+    override var acceptsFirstResponder: Bool { true }
+    override func isAccessibilityElement() -> Bool { false }
+    override func keyDown(with e: NSEvent) {
+        switch e.keyCode {
+        case 125: focusRow(0)
+        case 126: focusRow(lastItems.count - 1)
+        default: super.keyDown(with: e)
+        }
+    }
+    func focusRow(_ i: Int) {
+        guard !lastItems.isEmpty else { return }
+        let k = lastItems[max(0, min(lastItems.count - 1, i))].key
+        guard let r = rows[k] else { return }
+        window?.makeFirstResponder(r)
+        r.scrollToVisible(r.bounds)
+    }
+    func move(from key: String, by d: Int) {
+        guard let i = lastItems.firstIndex(where: { $0.key == key }) else { focusRow(0); return }
+        focusRow(i + d)
+    }
 
     // 세션 key 기준 diff 로 **제자리 갱신**. 행은 재사용하고(재생성하면 애니메이션이
     // 리셋된다), 내용이 바뀐 행만 다시 그리고, 위치가 바뀐 행만 옮긴다.
@@ -937,6 +1134,7 @@ final class SessionListView: NSView {
             if let r = rows[it.key] { row = r; row.update(it) } else {
                 row = SessionRowView(it, width: bounds.width)
                 row.onClick = { [weak self] i in self?.onClick?(i) }
+                row.onMove = { [weak self] k, d in self?.move(from: k, by: d) }
                 rows[it.key] = row
                 addSubview(row)
             }
@@ -944,33 +1142,94 @@ final class SessionListView: NSView {
             if row.frame != f { row.frame = f }
             y += ROW_H
         }
-        for (k, r) in rows where !seen.contains(k) { r.removeFromSuperview(); rows[k] = nil }
+        for (k, r) in rows where !seen.contains(k) {
+            // 키보드 포커스가 있던 행이 빠지면 목록으로 돌려서 ↑↓ 가 계속 먹게
+            if window?.firstResponder === r { window?.makeFirstResponder(self) }
+            r.removeFromSuperview(); rows[k] = nil
+        }
         return y
     }
     override func draw(_ dirty: NSRect) { C.bg.setFill(); bounds.fill() }
 }
 
+// 팝오버 높이 배치 (순수 함수).
+//   평소: 한도(usageH) + 목록 머리 + 목록(최대 LIST_MAX_H, 넘으면 목록만 스크롤) — 예전과 같다.
+//   그 합이 maxH(표시 화면 가용 높이 − 팝오버 테두리)를 넘으면: 목록을 통째로 펼치고
+//   한도+머리+목록 전체를 바깥 스크롤 하나로 (스크롤 안의 스크롤 없음). 승인 대기가 있으면
+//   승인 요약 줄을 그 위에 고정해서, 스크롤 위치와 상관없이 늘 보이게.
+struct PopLayout: Equatable {
+    var total: CGFloat        // 팝오버 내용 높이
+    var constrained: Bool     // 화면 높이에 걸렸나
+    var barH: CGFloat         // 위 고정 승인 요약 (0 = 없음)
+    var viewportH: CGFloat    // 바깥 스크롤의 보이는 높이
+    var contentH: CGFloat     // 바깥 스크롤의 내용 높이
+    var listVisH: CGFloat     // 안쪽 목록 스크롤의 보이는 높이
+}
+func popoverLayout(usageH: CGFloat, listH: CGFloat, attention: Bool, maxH: CGFloat) -> PopLayout {
+    let head = listH > 0 ? LIST_HEAD_H : 0
+    let vis = min(listH, LIST_MAX_H)
+    let natural = usageH + head + vis
+    let cap = max(POPOVER_MIN_H, maxH)
+    if natural <= cap {
+        return PopLayout(total: natural, constrained: false, barH: 0, viewportH: natural, contentH: natural, listVisH: vis)
+    }
+    let bar: CGFloat = attention ? ATTN_BAR_H : 0
+    let content = usageH + head + listH
+    let viewport = min(content, cap - bar)
+    return PopLayout(total: bar + viewport, constrained: true, barH: bar, viewportH: viewport,
+                     contentH: content, listVisH: listH)
+}
+// 팝오버가 뜰 화면(메뉴바 버튼이 있는 화면)의 가용 높이 → 팝오버 내용 최대 높이
+func popoverMaxHeight(visibleH: CGFloat) -> CGFloat { max(POPOVER_MIN_H, visibleH - POPOVER_CHROME) }
+
+// 높이 제한 모드에서 안쪽 목록 스크롤은 통째로 펼쳐져 있으니 휠을 바깥 스크롤로 넘긴다
+final class PassScrollView: NSScrollView {
+    var passThrough = false
+    override func scrollWheel(with e: NSEvent) {
+        if passThrough, let n = nextResponder { n.scrollWheel(with: e) } else { super.scrollWheel(with: e) }
+    }
+}
+
+final class FlippedView: NSView {
+    override var isFlipped: Bool { true }
+    override func draw(_ dirty: NSRect) { C.bg.setFill(); bounds.fill() }
+}
+
 // 위(한도) + 목록 머리 + 스크롤 목록을 세로로 쌓는다. 높이는 내용에 맞춰 늘고,
 // 목록은 LIST_MAX_H 를 넘으면 스크롤. 승인 필요 행은 정렬상 항상 맨 위.
+// 전체가 표시 화면 높이를 넘으면 popoverLayout 대로 바깥 스크롤 + 위 고정 승인 요약.
 final class PopoverView: NSView {
     let usage = UsageView(frame: NSRect(x: 0, y: 0, width: VIEW_W, height: VIEW_H))
     let head = ListHeadView(frame: NSRect(x: 0, y: 0, width: VIEW_W, height: LIST_HEAD_H))
-    let scroll = NSScrollView()
+    let scroll = PassScrollView()
     let list = SessionListView(frame: NSRect(x: 0, y: 0, width: VIEW_W, height: 0))
+    let outer = NSScrollView()
+    let content = FlippedView(frame: NSRect(x: 0, y: 0, width: VIEW_W, height: VIEW_H))
+    let attnBar = AttentionBarView(frame: NSRect(x: 0, y: 0, width: VIEW_W, height: ATTN_BAR_H))
     var listH: CGFloat = 0
+    var attentionCount = 0
+    var maxHeight: CGFloat = .greatestFiniteMagnitude     // App 이 팝오버를 열 때·화면이 바뀔 때 넣는다
+    private(set) var layoutNow = PopLayout(total: VIEW_H, constrained: false, barH: 0,
+                                           viewportH: VIEW_H, contentH: VIEW_H, listVisH: 0)
     var onSize: ((NSSize) -> Void)?
     override var isFlipped: Bool { true }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
-        addSubview(usage); addSubview(head); addSubview(scroll)
+        addSubview(outer); addSubview(attnBar)
+        outer.documentView = content
+        content.addSubview(usage); content.addSubview(head); content.addSubview(scroll)
         scroll.documentView = list
-        scroll.drawsBackground = false
-        scroll.hasVerticalScroller = true
-        scroll.autohidesScrollers = true
-        scroll.scrollerStyle = .overlay
-        scroll.verticalScrollElasticity = .none
+        for sv in [scroll, outer] {
+            sv.drawsBackground = false
+            sv.hasVerticalScroller = true
+            sv.autohidesScrollers = true
+            sv.scrollerStyle = .overlay
+            sv.verticalScrollElasticity = .none
+        }
+        attnBar.isHidden = true
+        attnBar.onClick = { [weak self] in self?.scrollToSessions() }
         usage.onHeightChange = { [weak self] _ in self?.relayout() }
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -981,50 +1240,141 @@ final class PopoverView: NSView {
         let key = usage.contentKey(now)
         if key != usage.drawnKey { usage.drawnKey = key; usage.needsDisplay = true }
         let items = listItems(s, now, done: done)
-        let cnt = items.filter { !$0.codex }.count
-        let att = items.filter { $0.state == .attention }.count
+        // 서비스별 개수 — Codex 만 떠 있어도 "0 LIVE" 가 되지 않게
+        let cl = items.filter { !$0.codex }.count
+        let cx = items.filter { $0.codex }.count
+        let attItems = items.filter { $0.state == .attention }
+        let att = attItems.count
         let dn = items.filter { $0.done }.count
-        if cnt != head.count || att != head.attention || dn != head.done {
-            head.count = cnt; head.attention = att; head.done = dn; head.needsDisplay = true
+        if cl != head.claude || cx != head.codex || att != head.attention || dn != head.done {
+            head.claude = cl; head.codex = cx; head.attention = att; head.done = dn; head.needsDisplay = true
         }
-        if let h = list.apply(items) {
-            if h != listH { listH = h; relayout() }
+        let first = attItems.first?.title ?? ""
+        if att != attnBar.count || first != attnBar.first {
+            attnBar.count = att; attnBar.first = first; attnBar.needsDisplay = true
         }
+        var needLayout = (att > 0) != (attentionCount > 0)
+        attentionCount = att
+        if let h = list.apply(items), h != listH { listH = h; needLayout = true }
+        if needLayout { relayout() }
     }
 
     var totalSize: NSSize {
-        let lh = listH > 0 ? LIST_HEAD_H + min(listH, LIST_MAX_H) : 0
-        return NSSize(width: VIEW_W, height: usage.measuredHeight + lh)
+        NSSize(width: VIEW_W, height: popoverLayout(usageH: usage.measuredHeight, listH: listH,
+                                                    attention: attentionCount > 0, maxH: maxHeight).total)
     }
 
     func relayout() {
         let uh = usage.measuredHeight
+        let L = popoverLayout(usageH: uh, listH: listH, attention: attentionCount > 0, maxH: maxHeight)
+        layoutNow = L
+        attnBar.isHidden = L.barH == 0
+        attnBar.frame = NSRect(x: 0, y: 0, width: VIEW_W, height: ATTN_BAR_H)
+        outer.frame = NSRect(x: 0, y: L.barH, width: VIEW_W, height: L.viewportH)
+        content.frame = NSRect(x: 0, y: 0, width: VIEW_W, height: L.contentH)
         usage.frame = NSRect(x: 0, y: 0, width: VIEW_W, height: uh)
         head.isHidden = listH == 0; scroll.isHidden = listH == 0
         head.frame = NSRect(x: 0, y: uh, width: VIEW_W, height: LIST_HEAD_H)
-        let vis = min(listH, LIST_MAX_H)
-        scroll.frame = NSRect(x: 0, y: uh + LIST_HEAD_H, width: VIEW_W, height: vis)
+        scroll.frame = NSRect(x: 0, y: uh + LIST_HEAD_H, width: VIEW_W, height: L.listVisH)
+        scroll.passThrough = L.constrained
         list.frame = NSRect(x: 0, y: 0, width: VIEW_W, height: listH)
-        onSize?(totalSize)
+        onSize?(NSSize(width: VIEW_W, height: L.total))
+    }
+
+    // 승인 요약 줄 클릭: 바깥 스크롤을 세션 목록 머리로 (승인 행은 정렬상 맨 위)
+    func scrollToSessions() {
+        let maxY = max(0, layoutNow.contentH - layoutNow.viewportH)
+        outer.contentView.scroll(to: NSPoint(x: 0, y: min(head.frame.minY, maxY)))
+        outer.reflectScrolledClipView(outer.contentView)
     }
     override func draw(_ dirty: NSRect) { C.bg.setFill(); bounds.fill() }
 }
 
+// 목록 머리 오른쪽 요약 (순수 함수). 0 인 서비스는 뺀다 (둘 다 0 이면 CLAUDE 0).
+// short = 좁을 때 줄인 표기.
+func headSummary(claude: Int, codex: Int, attention: Int, done: Int, short: Bool) -> String {
+    var parts: [String] = []
+    if attention > 0 { parts.append(short ? "\(attention) NEED" : "\(attention) NEED YOU") }
+    if done > 0 { parts.append("\(done) DONE") }
+    if claude > 0 || codex == 0 { parts.append(short ? "CL \(claude)" : "CLAUDE \(claude)") }
+    if codex > 0 { parts.append(short ? "CX \(codex)" : "CODEX \(codex)") }
+    return parts.joined(separator: short ? " · " : "  ·  ")
+}
+func headAccessibility(claude: Int, codex: Int, attention: Int, done: Int) -> String {
+    var p: [String] = []
+    if attention > 0 { p.append("승인 필요 \(attention)") }
+    if done > 0 { p.append("완료 \(done)") }
+    p.append("Claude \(claude)")
+    p.append("Codex \(codex)")
+    return p.joined(separator: ", ")
+}
+
 final class ListHeadView: NSView {
-    var count = -1
+    var claude = -1
+    var codex = 0
     var attention = 0
     var done = 0
     override var isFlipped: Bool { true }
+    override func isAccessibilityElement() -> Bool { true }
+    override func accessibilityRole() -> NSAccessibility.Role? { .staticText }
+    override func accessibilityLabel() -> String? { "세션" }
+    override func accessibilityValue() -> Any? {
+        headAccessibility(claude: max(0, claude), codex: codex, attention: attention, done: done)
+    }
     override func draw(_ dirty: NSRect) {
         C.bg.setFill(); bounds.fill()
         let padX: CGFloat = 20
         C.hair.setFill(); NSRect(x: padX, y: 2, width: bounds.width - 2 * padX, height: 1).fill()
-        attr("SESSIONS", 11, C.dim, weight: .semibold, tracking: 1.6).draw(at: NSPoint(x: padX, y: 14))
-        var right = "\(max(0, count)) LIVE"
-        if done > 0 { right = "\(done) DONE  ·  " + right }
-        if attention > 0 { right = "\(attention) NEED YOU  ·  " + right }
-        let r = attr(right, 9, attention > 0 ? C.amber : done > 0 ? C.sage : C.faint, tracking: 0.6)
+        let title = attr("SESSIONS", 11, C.dim, weight: .semibold, tracking: 1.6)
+        title.draw(at: NSPoint(x: padX, y: 14))
+        let color = attention > 0 ? C.amber : done > 0 ? C.sage : C.faint
+        let room = bounds.width - 2 * padX - title.size().width - 12
+        var r = attr(headSummary(claude: max(0, claude), codex: codex, attention: attention, done: done, short: false),
+                     9, color, tracking: 0.6)
+        if r.size().width > room {
+            r = attr(headSummary(claude: max(0, claude), codex: codex, attention: attention, done: done, short: true),
+                     9, color, tracking: 0.6)
+        }
         r.draw(at: NSPoint(x: bounds.width - padX - r.size().width, y: 15))
+    }
+}
+
+// 높이 제한에 걸렸을 때만 팝오버 맨 위에 고정되는 승인 요약 한 줄. 정적 (애니메이션 없음).
+// 클릭/Return/VoiceOver 누르기 = 세션 목록으로 스크롤.
+final class AttentionBarView: NSView {
+    var count = 0
+    var first = ""
+    var onClick: (() -> Void)?
+    override var isFlipped: Bool { true }
+    override func isAccessibilityElement() -> Bool { true }
+    override func accessibilityRole() -> NSAccessibility.Role? { .button }
+    override func accessibilityLabel() -> String? { "승인 필요 \(count)개" + (first.isEmpty ? "" : " — " + first) }
+    override func accessibilityHelp() -> String? { "누르면 세션 목록으로 스크롤" }
+    override func accessibilityPerformPress() -> Bool { onClick?(); return true }
+    override var acceptsFirstResponder: Bool { true }
+    override var canBecomeKeyView: Bool { true }
+    override var focusRingMaskBounds: NSRect { bounds.insetBy(dx: 6, dy: 3) }
+    override func drawFocusRingMask() { NSBezierPath(roundedRect: bounds.insetBy(dx: 6, dy: 3), xRadius: 6, yRadius: 6).fill() }
+    override func keyDown(with e: NSEvent) {
+        if [36, 76, 49].contains(e.keyCode) { onClick?() } else { super.keyDown(with: e) }
+    }
+    override func acceptsFirstMouse(for e: NSEvent?) -> Bool { true }
+    override func mouseDown(with e: NSEvent) {}
+    override func mouseUp(with e: NSEvent) {
+        if bounds.contains(convert(e.locationInWindow, from: nil)) { onClick?() }
+    }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
+    override func draw(_ dirty: NSRect) {
+        C.bg.setFill(); bounds.fill()
+        let padX: CGFloat = 20
+        let a = attr("승인 필요 \(count)", 11, C.amber, weight: .semibold)
+        a.draw(at: NSPoint(x: padX, y: 8))
+        if !first.isEmpty {
+            let x = padX + a.size().width + 10
+            let chars = max(6, Int((bounds.width - x - padX) / 7.0))
+            attr(clip(first, chars), 11, C.dim).draw(at: NSPoint(x: x, y: 8))
+        }
+        C.hair.setFill(); NSRect(x: padX, y: bounds.height - 1, width: bounds.width - 2 * padX, height: 1).fill()
     }
 }
 
@@ -1246,24 +1596,83 @@ func ghosttyFocus(pid: Int32, names: [String]) -> GhosttyPick {
     }
 }
 
-func activateBundle(_ id: String, tag: String, done: ((Bool) -> Void)? = nil) {
+enum BundleActivation { case front, launching, failed }
+
+func activateBundle(_ id: String, tag: String, done: ((BundleActivation) -> Void)? = nil) {
     if let app = NSRunningApplication.runningApplications(withBundleIdentifier: id).first {
-        bringToFront(app.processIdentifier, tag: tag) { ok, _ in done?(ok) }
+        bringToFront(app.processIdentifier, tag: tag) { ok, _ in done?(ok ? .front : .failed) }
     } else if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) {
         logLine("focus \(tag) open-app")
         NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
-        done?(false)
-    } else { done?(false) }
+        done?(.launching)
+    } else { done?(.failed) }
 }
 
-// done(true) = 그 창(프로세스)이 실제로 맨 앞에 왔다 (0.3초 뒤 확인)
-func focus(_ it: ListItem, done: ((Bool) -> Void)? = nil) {
+// ── 창 이동 결과 ──
+// 행 클릭이 "그 세션 창"까지 갔는지, 앱(프로세스)만 올라왔는지, 권한이 없어 못 골랐는지를 구분한다.
+enum FocusOutcome: Equatable {
+    case window                       // 그 세션의 터미널 창(탭)을 골라 맨 앞으로
+    case target(String)               // 원래 대상이 앱인 행 (Codex Work → ChatGPT 앱)
+    case appOnly(String)              // 앱만 맨 앞 — 창은 못 고름 (이유)
+    case permission(front: Bool)      // "Ghostty 제어" 권한 없음 — 창을 못 고름 (앱은 올라왔나)
+    case failed(String)               // 맨 앞으로 못 가져옴
+
+    var reachedFront: Bool {          // --focus 요청 ack (예전 done(Bool) 과 같은 뜻)
+        switch self {
+        case .window, .target, .appOnly: return true
+        case .permission(let f): return f
+        case .failed: return false
+        }
+    }
+}
+
+// (순수 함수) Ghostty 창 고르기 결과 + 맨 앞 확인 → 결과. pick 이 nil 이면 창 고르기를 안 한 경우 (why = 이유)
+func focusOutcome(pick: GhosttyPick?, frontOK: Bool, why: String) -> FocusOutcome {
+    if case .denied(let code)? = pick, code == -1743 || code == -1744 { return .permission(front: frontOK) }
+    if !frontOK { return .failed("앱이 맨 앞으로 오지 않음") }
+    guard let pick else { return .appOnly(why) }
+    switch pick {
+    case .focused: return .window
+    case .noMatch: return .appOnly("같은 제목의 창을 못 찾음")
+    case .ambiguous(let n): return .appOnly("같은 제목의 창이 \(n)개")
+    case .denied(let code): return .appOnly("Ghostty 응답 없음 (\(code))")
+    case .failed: return .appOnly("창 목록 조회 실패")
+    }
+}
+
+// (순수 함수) 사용자에게 보일 문구: (제목, 설명, 종류 0=성공 1=부분 2=실패)
+func focusMessage(_ o: FocusOutcome) -> (title: String, detail: String?, level: Int) {
+    switch o {
+    case .window: return ("세션 창으로 이동했습니다", nil, 0)
+    case .target(let s): return (s, nil, 0)
+    case .appOnly(let why): return ("앱만 활성화 — 창은 못 고름", why, 1)
+    case .permission(let front):
+        return (front ? "권한 필요 — 앱만 활성화" : "권한 필요 — 이동 못 함",
+                "시스템 설정 › 개인정보 보호 및 보안 › 자동화 › KbUsage 에서 Ghostty 허용", 2)
+    case .failed(let why): return ("창으로 이동 못 함", why, 2)
+    }
+}
+
+// done = 결과 (0.3초 뒤 실제 맨 앞 앱 pid 로 확인한 것 포함)
+func focus(_ it: ListItem, done: ((FocusOutcome) -> Void)? = nil) {
     let tag = keyTag(it.key)
-    if it.work { activateBundle("com.openai.codex", tag: tag, done: done); return }   // Codex Work → ChatGPT 앱
+    if it.work {                                                    // Codex Work → ChatGPT 앱
+        activateBundle("com.openai.codex", tag: tag) { r in
+            switch r {
+            case .front: done?(.target("ChatGPT 앱으로 이동했습니다"))
+            case .launching: done?(.target("ChatGPT 앱을 여는 중"))
+            case .failed: done?(.failed("ChatGPT 앱이 맨 앞으로 오지 않음"))
+            }
+        }
+        return
+    }
     // Claude 세션 / Codex CLI: 그 터미널 창 프로세스. 모르면 Ghostty 앱까지만
     if let pid = it.termPid, let app = lookupApp(pid, tag: tag) {
         guard app.bundleIdentifier == GHOSTTY_ID, !it.matchNames.isEmpty else {
-            bringToFront(pid, tag: tag) { ok, _ in done?(ok) }; return
+            let why = app.bundleIdentifier != GHOSTTY_ID ? "Ghostty 가 아닌 터미널 — 창 고르기 미지원"
+                : it.codex ? "Codex CLI 는 창 제목 정보가 없음" : "세션 이름을 몰라 창을 못 고름"
+            bringToFront(pid, tag: tag) { ok, _ in done?(focusOutcome(pick: nil, frontOK: ok, why: why)) }
+            return
         }
         // 그 Ghostty 프로세스 안에서 세션 창(터미널)을 먼저 고르고, 앱도 Apple Event 로 올린 뒤
         // (같은 대상이라 이미 받은 "Ghostty 제어" 권한으로 충분) 프로세스 단위 체인으로 확인
@@ -1274,12 +1683,78 @@ func focus(_ it: ListItem, done: ((Bool) -> Void)? = nil) {
             DispatchQueue.main.async {
                 logLine("focus \(tag) ghostty-pick=\(pick)")
                 if let act { logLine("focus \(tag) pid=\(pid) step=ghostty-activate ret=\(act)") }
-                bringToFront(pid, tag: tag) { ok, _ in done?(ok) }
+                bringToFront(pid, tag: tag) { ok, _ in done?(focusOutcome(pick: pick, frontOK: ok, why: "")) }
             }
         }
     } else {
         logLine("focus \(tag) term_pid=\(it.termPid.map(String.init) ?? "nil") → Ghostty app")
-        activateBundle(GHOSTTY_ID, tag: tag, done: done)
+        activateBundle(GHOSTTY_ID, tag: tag) { r in
+            done?(r == .front ? .appOnly("세션의 터미널 창을 모름") : .failed("Ghostty 가 맨 앞으로 오지 않음"))
+        }
+    }
+}
+
+// 행 클릭 결과 알림: 메뉴바 아래 잠깐 뜨는 작은 패널 (포커스 안 뺏음, 애니메이션 없음) + VoiceOver 안내.
+final class FocusToast {
+    private var panel: NSPanel?
+    private var hideWork: DispatchWorkItem?
+
+    func show(_ o: FocusOutcome, below button: NSStatusBarButton?) {
+        let m = focusMessage(o)
+        let color = m.level == 0 ? C.sage : m.level == 1 ? C.amber : C.rose
+        let t = attr(m.title, 12, color, weight: .semibold)
+        let d = m.detail.map { attr($0, 10, C.dim) }
+        let padX: CGFloat = 14, padY: CGFloat = 9
+        let w = min(360, max(200, max(t.size().width, d?.size().width ?? 0) + 2 * padX))
+        let h = padY * 2 + t.size().height + (d.map { $0.size().height + 3 } ?? 0)
+
+        let p = panel ?? {
+            let p = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
+                            backing: .buffered, defer: true)
+            p.level = .statusBar
+            p.isOpaque = false
+            p.backgroundColor = .clear
+            p.hasShadow = true
+            p.ignoresMouseEvents = true
+            p.hidesOnDeactivate = false
+            p.collectionBehavior = [.canJoinAllSpaces, .transient, .ignoresCycle]
+            p.isReleasedWhenClosed = false
+            panel = p
+            return p
+        }()
+        let v = ToastView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        v.title = t; v.detail = d; v.padX = padX; v.padY = padY
+        p.contentView = v
+        // 메뉴바 버튼 바로 아래, 화면 안으로
+        var origin = NSPoint(x: 100, y: 100)
+        if let b = button, let bw = b.window {
+            let f = bw.convertToScreen(b.convert(b.bounds, to: nil))
+            let vis = bw.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? f
+            origin.x = min(max(vis.minX + 8, f.midX - w / 2), vis.maxX - w - 8)
+            origin.y = vis.maxY - h - 6
+        }
+        p.setFrame(NSRect(origin: origin, size: NSSize(width: w, height: h)), display: true)
+        p.orderFrontRegardless()
+        NSAccessibility.post(element: NSApp as Any, notification: .announcementRequested,
+                             userInfo: [.announcement: m.title + (m.detail.map { ". " + $0 } ?? ""),
+                                        .priority: NSAccessibilityPriorityLevel.high.rawValue])
+        hideWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.panel?.orderOut(nil) }
+        hideWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + (m.level == 0 ? 1.6 : m.level == 1 ? 4 : 7), execute: work)
+    }
+
+    final class ToastView: NSView {
+        var title = NSAttributedString(); var detail: NSAttributedString?
+        var padX: CGFloat = 14; var padY: CGFloat = 9
+        override var isFlipped: Bool { true }
+        override func draw(_ dirty: NSRect) {
+            let r = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 8, yRadius: 8)
+            C.bg.setFill(); r.fill()
+            C.hair.setStroke(); r.lineWidth = 1; r.stroke()
+            title.draw(at: NSPoint(x: padX, y: padY))
+            detail?.draw(at: NSPoint(x: padX, y: padY + title.size().height + 3))
+        }
     }
 }
 
@@ -1459,6 +1934,15 @@ func iconData(_ s: Snap, _ now: Double) -> IconData {
                     cxDown: down, attention: s.attention)
 }
 
+// 메뉴바 버튼 접근성 값 (순수 함수) — 아이콘이 그리는 것과 같은 정보를 글로
+func iconAccessibilityValue(_ d: IconData, done: Bool) -> String {
+    func p(_ v: Double?) -> String { v.map { "\(Int($0.rounded()))%" } ?? "값 없음" }
+    var s = "Claude 5시간 \(p(d.five)), 주간 \(p(d.seven))" + (d.stale ? " (오래된 값)" : "")
+    s += d.cxDown ? ". Codex 조회 불가" : ". Codex 5시간 \(p(d.cxFive)), 주간 \(p(d.cxSeven))"
+    if d.attention { s += ". 승인 대기 세션 있음" } else if done { s += ". 끝난 작업 있음" }
+    return s
+}
+
 func isDarkDrawing() -> Bool {
     NSAppearance.currentDrawing().bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
 }
@@ -1600,6 +2084,10 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var doneMin: Double { ud.object(forKey: "doneNotifyMinMinutes") == nil ? 1 : ud.double(forKey: "doneNotifyMinMinutes") }
     var doneSound: String { ud.string(forKey: "doneSound") ?? "Tink" }
     let banner = DoneBanner()
+    let toast = FocusToast()
+    let startedAt = Date().timeIntervalSince1970
+    var codexExit: Int32?                     // 데몬이 마지막으로 끝난 exit 코드 (STARTING 실패 이유용)
+    var a11yValue = ""
 
     var variant: String {
         let v = UserDefaults.standard.string(forKey: "iconVariant") ?? ICON_DEFAULT
@@ -1634,13 +2122,37 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
             logLine("focus-request \(keyTag("c:" + sid))")
             guard let it = itemForSession(String(sid.prefix(64))) else { logLine("focus-request no-session"); ack(false); return }
-            focus(it) { ok in ack(ok) }
+            focus(it) { o in ack(o.reachedFront) }
         }
 
+        // 행 클릭(마우스·키보드·VoiceOver 누르기 공통): 팝오버를 닫고 창으로 간 뒤, 결과를 메뉴바 아래에 잠깐 보인다
+        // (성공 / 앱만 활성화 / 권한 필요 구분 — focusOutcome)
         view.list.onClick = { [weak self] it in
             if !it.codex, it.key.hasPrefix("c:") { self?.clearDone(String(it.key.dropFirst(2)), reason: "click") }
             self?.popover.performClose(nil)
-            DispatchQueue.main.async { focus(it) }   // 팝오버가 닫힌 뒤에
+            DispatchQueue.main.async {               // 팝오버가 닫힌 뒤에
+                focus(it) { o in
+                    logLine("focus \(keyTag(it.key)) outcome=\(o)")
+                    self?.toast.show(o, below: self?.item.button)
+                }
+            }
+        }
+        item.button?.setAccessibilityLabel("Claude·Codex 사용량")
+        item.button?.setAccessibilityHelp("누르면 한도와 세션 목록 팝오버")
+        // 표시 화면이 바뀌면(미러링·해상도·디스플레이 연결) 팝오버 최대 높이 다시
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            self.view.maxHeight = self.popoverMaxH()
+            self.view.relayout()
+        }
+        // "동작 줄이기"를 바꾸면 이미 붙은 애니메이션도 바로 따른다
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            logLine("reduce-motion=\(reduceMotion())")
+            for r in self.view.list.rows.values { r.icon.applyMotion(restart: false) }
+            self.updateAttentionDot(self.snap())
         }
 
         let vc = NSViewController()
@@ -1671,7 +2183,26 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         p.arguments = [CX_SCRIPT, "--daemon"]
         p.standardInput = FileHandle.nullDevice
         p.standardOutput = FileHandle.nullDevice   // stderr 는 menubar.log 로 (트레이스백만)
-        do { try p.run(); codexProc = p } catch { codexProc = nil }
+        p.terminationHandler = { [weak self] proc in
+            let st = proc.terminationStatus
+            DispatchQueue.main.async { self?.codexExit = st; logLine("codex-daemon exit=\(st)") }
+        }
+        do { try p.run(); codexProc = p } catch { codexProc = nil; logLine("codex-daemon start failed") }
+    }
+
+    // readSnap + 앱만 아는 것 (Codex 데몬 상태)
+    func snap() -> Snap {
+        var s = readSnap()
+        s.codexDaemon = CodexDaemonInfo(appStartedAt: startedAt,
+                                        scriptExists: FileManager.default.fileExists(atPath: CX_SCRIPT),
+                                        running: codexProc.map { $0.isRunning }, exitStatus: codexExit)
+        return s
+    }
+
+    // 메뉴바 버튼이 있는 화면의 가용 높이 기준 팝오버 최대 높이
+    func popoverMaxH() -> CGFloat {
+        guard let scr = item.button?.window?.screen ?? NSScreen.main else { return .greatestFiniteMagnitude }
+        return popoverMaxHeight(visibleH: scr.visibleFrame.height)
     }
 
     // 바깥 클릭으로 닫혀도(transient) 1초 타이머를 끈다
@@ -1685,14 +2216,20 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if popover.isShown {
             popover.performClose(nil)
         } else {
-            let snap = readSnap()
+            let snap = self.snap()
             acked.formUnion(attentionKeys(snap))     // 팝오버로 봤으니 지금 대기들은 펄스 정지
             seeDoneInPopover()                       // 완료도 본 것으로 → 메뉴바 점 끔, 행 강조는 닫을 때까지
             updateAttentionDot(snap)
+            view.maxHeight = popoverMaxH()
             view.apply(snap, done: doneShown)
+            view.relayout()
             popover.contentSize = view.totalSize
+            popover.animates = !reduceMotion()
             popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
             popover.contentViewController?.view.window?.makeKey()
+            // 키보드: ↑↓ 로 행 고르기 (목록이 먼저 키를 받는다)
+            popover.contentViewController?.view.window?.autorecalculatesKeyViewLoop = true
+            popover.contentViewController?.view.window?.makeFirstResponder(view.list)
             // 팝오버가 화면에 붙은 뒤 한 번 더 그려서 (동기) 높이를 즉시 확정.
             view.usage.displayIfNeeded()
             fastTimer?.invalidate()
@@ -1703,7 +2240,7 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     func refresh() {
-        let s = readSnap()
+        let s = snap()
         sounds(s)                                  // 완료 감지 → doneUnseen
         pruneDone(s)
         if popover.isShown { seeDoneInPopover(); view.apply(s, done: doneShown) }   // 닫혀 있을 땐 아이콘만
@@ -1718,6 +2255,8 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             item.button?.image?.isTemplate = false
             item.button?.title = ""
         }
+        let v = iconAccessibilityValue(d, done: !doneUnseen.isEmpty)
+        if v != a11yValue { a11yValue = v; item.button?.setAccessibilityValue(v) }
     }
 
     func attentionKeys(_ s: Snap) -> Set<String> {
@@ -1735,7 +2274,7 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let done = !attn && !doneUnseen.isEmpty && !popover.isShown
         let show = attn || done
         let pulse = (attn ? !keys.subtracting(acked).isEmpty && !popover.isShown : done)
-            && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            && !reduceMotion()
         let kind = attn ? "attention" : done ? "done" : "none"
         if kind != dotKind { logLine("dot \(kind)" + (done ? " \(doneUnseen.keys.map { keyTag("c:" + $0) }.sorted().joined(separator: ","))" : "")); dotKind = kind }
         CATransaction.begin(); CATransaction.setDisableActions(true)

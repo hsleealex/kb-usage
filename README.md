@@ -19,6 +19,8 @@ codex_usage.py   공식 `codex app-server --stdio` 에 한도·최근 스레드�
                  codex_limits.json 에 쓴다. 메뉴바 앱이 --daemon 으로 띄운다.
 kb-usage-menubar Swift 메뉴바 앱. 위 파일들을 2초마다 폴링해서 표시.
                  팝오버 높이는 내용에 맞춰 늘고 준다 (세션 목록은 넘치면 스크롤).
+                 전체가 표시 화면 가용 높이를 넘으면(작은 미러링 화면 등) 화면 높이로
+                 자르고 전체를 한 번에 스크롤 — 승인 대기가 있으면 요약 줄을 맨 위에 고정.
 ```
 
 ## 왜 메뉴바인가 (iCUE 키보드 화면이 아니라)
@@ -83,6 +85,9 @@ Codex CLI 는 statusLine 훅이 없어서, 공식 **`codex app-server --stdio`**
   하나를 붙잡고 **60초마다** 조회만 한다 (app-server 를 매번 띄우면 1초쯤 걸리고
   `~/.codex` 상태 DB·플러그인 캐시를 매번 건드려서). 앱이 죽으면 데몬도 내려간다.
 - 조회 실패/데몬 멎음 → 팝오버에 `UNAVAILABLE` + `LAST OK N분 전`, 옛 % 는 흐리게.
+- 첫 기록 전엔 `STARTING… Ns`. 45초가 지나거나 원인이 보이면 이유로 바꾼다 (스크립트 없음 /
+  `codex_limits.json` 읽기 실패 / 수집 데몬 종료(exit N) / N초째 첫 기록 없음). 성공한 적 없이
+  조회만 실패하면 `NO DATA — APP-SERVER: <사유>`.
 - 리셋 시각이 지난 창은 0% (`reset since last check`).
 - 실행 파일은 `~/.local/bin/codex` 우선, 없으면 PATH 의 `codex`.
 - 스레드 상태(`status`)는 app-server 가 **자기가 로드한 스레드**에만 준다. 다른
@@ -91,7 +96,7 @@ Codex CLI 는 statusLine 훅이 없어서, 공식 **`codex app-server --stdio`**
 
 - **소진 ETA** — Claude 쪽(statusline.py)과 같은 방식: 10분+ 간격 baseline 대비 %상승
   기울기로 `eta_at` 을 계산해 5H / WEEKLY 막대 아래 `est. … to limit`.
-- **BY MODEL / WEEK** — 서버가 모델별 사용량을 안 줘서 **이 Mac 의 rollout 을 로컬 집계**:
+- **BY MODEL** (주간 토큰 비중) — 서버가 모델별 사용량을 안 줘서 **이 Mac 의 rollout 을 로컬 집계**:
   `turn_context`(payload.model)로 현재 모델을 따라가고 `token_count` 의
   `last_token_usage.total_tokens`(input 캐시 포함 + output reasoning 포함 — Claude 쪽
   model_usage.py 와 같은 정의)를 더한다. 같은 턴이 겹쳐 찍힌 token_count 는 한 번만.
@@ -144,8 +149,17 @@ python3 codex_usage.py --print    # 한 번 조회 → codex plus: 5h 24%  7d 4%
   경로로 기록해 설정 화면에 안 나타난다. 권한 상태는 `menubar.log` 의
   `ae-permission … status=` (0 허용, -1743 거부, -1744 미결정 → 물음)로 보인다.
   클릭·포커스 단계는 `menubar.log` 에 key 앞 8자·pid·결과만 남는다.
+- **클릭 결과 표시**: 팝오버가 닫힌 뒤 메뉴바 아래에 작은 안내가 잠깐 뜬다 (포커스는 안 뺏음,
+  VoiceOver 에도 읽어줌) — `세션 창으로 이동했습니다` / `앱만 활성화 — 창은 못 고름`(+ 이유: 같은
+  제목 창 N개, 창 제목 정보 없음 등) / `권한 필요`(+ 자동화 설정 경로) / `창으로 이동 못 함`.
+- **키보드·VoiceOver**: 팝오버를 열고 ↓/↑ 로 행을 고르고 Return·Space 로 이동. 행은 접근성
+  버튼(라벨 = 이름 + 상태, 값 = 진행·컨텍스트), 한도는 진행 표시기(사용 %·리셋·ETA)로 읽힌다.
 - Codex CLI(`source` = `cli`, codex-tui): 그 스레드의 rollout 을 연 codex CLI 프로세스가
-  지금 떠 있을 때만 (`live`). 클릭 = 그 프로세스의 터미널 창, 모르면 Ghostty 앱.
+  지금 떠 있을 때만 (`live`, 90초 넘게 묵은 live 는 안 믿음 — 데몬은 20초마다는 갱신).
+  클릭 = 그 프로세스의 터미널 창, 모르면 Ghostty 앱.
+- Codex 행은 **`상태 확인 불가 · 승인 알림 미지원`** 을 셋째 줄에 적는다. 남의 프로세스(CLI·
+  ChatGPT 앱)가 돌리는 스레드의 승인 대기·idle 을 믿을 만하게 얻을 곳이 없어서다 (app-server
+  status 는 자기가 로드한 스레드만, rollout·상태 DB 에는 승인 이벤트 없음, notify 는 턴 완료만).
 - Codex Work: ChatGPT 앱(`com.openai.codex`)이 떠 있을 때만 한 줄 — 앱 스레드
   (`vscode` = Codex Desktop / Work)를 묶는다. 마지막 활동 · 최근 30분 스레드 수,
   클릭 = ChatGPT 앱.
@@ -154,7 +168,9 @@ python3 codex_usage.py --print    # 한 번 조회 → codex plus: 5h 24%  7d 4%
 종류(돌쇠 → 개똥이 → 기타 Claude → Codex CLI → Codex Work) → 세션 시작 시각.
 갱신 시각으로는 정렬하지 않는다. 목록은 세션 key 로 diff 해서 제자리 갱신하고
 (행 재사용, 바뀐 행만 다시 그림, 같은 입력이면 아무것도 안 함), 깜빡임은 승인 필요
-행에만 붙는 레이어 애니메이션이라 새로고침에 재시작되지 않는다.
+행에만 붙는 레이어 애니메이션이라 새로고침에 재시작되지 않는다. 행 아이콘의 깜빡임·숨쉬기·
+완료 펄스는 모두 "동작 줄이기"를 따른다 (켜면 정적 모양, 설정을 바꾸면 바로 반영).
+목록 머리 오른쪽은 서비스별 개수(`CLAUDE 3 · CODEX 1`, 0 인 쪽은 생략).
 
 훅은 모든 세션의 모든 도구 호출에 붙으므로 **아무것도 출력하지 않고, 항상 exit 0,
 ~35ms**. 기록하는 건 상태·시각·도구 이름·파일 basename·todo 개수와 진행 항목
@@ -295,7 +311,8 @@ session_id / session_name / model / workspace / effort / thinking / fast_mode
 - **CLAUDE** — Anthropic `rate_limits`. 막대 아래 **소진 ETA**: `statusline.py` 가 각
   창의 `rate_ref`(10분+ 간격 baseline) 대비 %상승 기울기로 `eta_at` 을 계산 → 리셋보다
   이르면 서비스 색으로 경고. 페이스가 느리면(10분에 <0.5%p) 줄 안 뜸. 하위 블록
-  **BY MODEL / WEEK** — 이번 주 토큰 비중 + 막대 (종량 과금 모델만 `$N`).
+  **BY MODEL** — 오른쪽 열은 늘 **주간 토큰 비중 %** + 막대. 종량 과금 모델(페이블 등)의
+  실제 청구액은 같은 열에 섞지 않고 아래 `종량 청구 · … $N` 줄로 따로.
 - **CODEX** — 위 "Codex 한도".
 - **SESSIONS** — 위 "세션 목록". 최대 330pt, 넘치면 스크롤.
 

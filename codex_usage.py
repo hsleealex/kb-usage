@@ -608,6 +608,9 @@ def poll_failed(prev, err):
 # 파일 내용은 안 읽는다. app-server / exec / exec-server / ChatGPT 앱 자식은 뺀다.
 # 프로세스가 rollout 을 아직 안 열었거나(첫 메시지 전) 매칭이 안 되면 행을 안 만든다.
 LIVE_SECONDS = 10
+# 안 바뀌어도 이 간격마다는 써서 live.checked_at 을 갱신한다. 메뉴바는 live 가
+# CODEX_LIVE_MAX_AGE(90초)보다 묵으면 안 믿는다 — 10초 틱·한도 조회 멈춤까지 더해도 그 안에 들게.
+LIVE_HEARTBEAT = 20
 _LSTART = "%a %b %d %H:%M:%S %Y"
 
 
@@ -721,7 +724,7 @@ def daemon(out_path=CX_JSON, exe=None):
             cli = live_cli()
             changed = cli != (out.get("live") or {}).get("cli")
             out["live"] = {"checked_at": now, "cli": cli}
-            if changed or now - live_written > 30:   # 30초마다는 checked_at 갱신용으로 씀
+            if changed or now - live_written >= LIVE_HEARTBEAT:   # 안 바뀌어도 checked_at 갱신용으로 씀
                 live_written = now
                 atomic_write(out_path, out)
         if now >= next_at:
