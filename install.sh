@@ -29,6 +29,9 @@ cp "$BASE/kb-usage-menubar" "$APP/Contents/MacOS/kb-usage-menubar"
 # 앱 아이콘 — 서명이 Resources 까지 봉인하므로 반드시 sign 앞에서 복사한다
 cp "$BASE/bundle/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 sign "$APP"
+# URL 스킴 kbusage:// 가 이 번들로 오도록 LaunchServices 에 (재)등록 — 실패해도 설치는 계속
+LSREG="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+"$LSREG" -f "$APP" || echo "! lsregister 실패 — kbusage:// 링크가 안 열릴 수 있음"
 
 # 2. plist 설치 (__BASE__ 치환)
 mkdir -p "$HOME/Library/LaunchAgents"

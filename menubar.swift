@@ -1694,7 +1694,29 @@ func focus(_ it: ListItem, done: ((FocusOutcome) -> Void)? = nil) {
     }
 }
 
+// (순수 함수) hideMenuIcon 설정값 → 아이콘 숨김 여부. 키 없음·해석 안 되는 값이면 false(= 보임, 지금과 같음).
+// 숫자·Bool 은 UserDefaults.bool 과 같은 뜻(0 이 아니면 참), 문자열은 yes/true/1 만 참.
+func parseHideMenuIcon(_ v: Any?) -> Bool {
+    if let n = v as? NSNumber { return n.boolValue }
+    if let s = v as? String { return ["yes", "true", "1"].contains(s.trimmingCharacters(in: .whitespaces).lowercased()) }
+    return false
+}
+
+// (순수 함수) 알림 패널 위치: 메뉴바 버튼 바로 아래(그 버튼이 있는 화면 안쪽).
+// 버튼 위치를 모르거나(아이콘 숨김·창 없음·크기 0) 버튼이 어느 화면에도 없으면(Ice 로 밀려남 등)
+// fallback(기본 화면 visibleFrame) 상단 가운데. 좌우는 화면 안쪽 8pt 로 자른다.
+func toastOrigin(button: NSRect?, screens: [(frame: NSRect, visible: NSRect)], fallback: NSRect, size: NSSize) -> NSPoint {
+    var vis = fallback, cx = fallback.midX
+    if let f = button, f.width > 0, f.height > 0,
+       let s = screens.first(where: { $0.frame.contains(NSPoint(x: f.midX, y: f.midY)) }) {
+        vis = s.visible; cx = f.midX
+    }
+    return NSPoint(x: min(max(vis.minX + 8, cx - size.width / 2), vis.maxX - size.width - 8),
+                   y: vis.maxY - size.height - 6)
+}
+
 // 행 클릭 결과 알림: 메뉴바 아래 잠깐 뜨는 작은 패널 (포커스 안 뺏음, 애니메이션 없음) + VoiceOver 안내.
+// button 이 nil 이면(아이콘 숨김) 화면 상단 가운데.
 final class FocusToast {
     private var panel: NSPanel?
     private var hideWork: DispatchWorkItem?
@@ -1725,14 +1747,12 @@ final class FocusToast {
         let v = ToastView(frame: NSRect(x: 0, y: 0, width: w, height: h))
         v.title = t; v.detail = d; v.padX = padX; v.padY = padY
         p.contentView = v
-        // 메뉴바 버튼 바로 아래, 화면 안으로
-        var origin = NSPoint(x: 100, y: 100)
-        if let b = button, let bw = b.window {
-            let f = bw.convertToScreen(b.convert(b.bounds, to: nil))
-            let vis = bw.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? f
-            origin.x = min(max(vis.minX + 8, f.midX - w / 2), vis.maxX - w - 8)
-            origin.y = vis.maxY - h - 6
-        }
+        // 메뉴바 버튼 바로 아래, 화면 안으로 (버튼 위치를 모르면 기본 화면 상단 가운데)
+        var bf: NSRect?
+        if let b = button, let bw = b.window { bf = bw.convertToScreen(b.convert(b.bounds, to: nil)) }
+        let origin = toastOrigin(button: bf, screens: NSScreen.screens.map { (frame: $0.frame, visible: $0.visibleFrame) },
+                                 fallback: NSScreen.main?.visibleFrame ?? NSScreen.screens.first?.visibleFrame ?? .zero,
+                                 size: NSSize(width: w, height: h))
         p.setFrame(NSRect(origin: origin, size: NSSize(width: w, height: h)), display: true)
         p.orderFrontRegardless()
         NSAccessibility.post(element: NSApp as Any, notification: .announcementRequested,
@@ -1774,6 +1794,31 @@ func itemForSession(_ sid: String) -> ListItem? {
     let sl = readJSON((SESS_DIR as NSString).appendingPathComponent(sid + ".json"))?["name"] as? String
     return ListItem(key: "c:" + sid, codex: false, state: .unknown, title: "", status: "", progress: "",
                     right2: "", termPid: term, matchNames: [sl, rp.name].compactMap { $0 }.filter { !$0.isEmpty })
+}
+
+// 세션 id → 그 세션 창을 앞으로 (FOCUS_REQ · kbusage://focus 공통). 세션이 없으면 done(nil)
+func focusSession(_ sid: String, done: @escaping (FocusOutcome?) -> Void) {
+    guard let it = itemForSession(String(sid.prefix(64))) else { done(nil); return }
+    focus(it) { done($0) }
+}
+
+// ── URL 스킴 kbusage://focus?sid=<session_id> ──
+// 샌드박스 앱(Apple Events·프로세스 실행 불가)도 NSWorkspace.open 한 번으로 세션 창을 부를 수 있게.
+// 동작은 "그 세션 창 앞으로" 하나뿐이다. (순수 함수) 맞으면 sid, 아니면 nil:
+//   scheme kbusage(대소문자 무시) · host 정확히 focus · 경로/포트/사용자/fragment 없음
+//   · 쿼리는 sid 하나만(중복·다른 키 거부) · 값은 [A-Za-z0-9._-]{1,64}
+func parseFocusURL(_ url: URL) -> String? {
+    guard let c = URLComponents(url: url, resolvingAgainstBaseURL: false),
+          c.scheme?.lowercased() == "kbusage", c.host == "focus",
+          c.path.isEmpty, c.port == nil, c.user == nil, c.password == nil, c.fragment == nil,
+          let items = c.queryItems, items.count == 1, items[0].name == "sid",
+          let sid = items[0].value, (1...64).contains(sid.utf8.count),
+          sid.utf8.allSatisfy({ b in
+              (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A)
+                  || b == 0x2E || b == 0x5F || b == 0x2D      // . _ -
+          })
+    else { return nil }
+    return sid
 }
 
 func requestFocusCLI(_ sid: String) -> Int32 {
@@ -2064,6 +2109,7 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var attnSeen: Set<String>?          // 지난 갱신 때의 승인 대기 키 (nil = 아직 기준선 없음)
     var lastAttnSound = 0.0
     var dotKind = ""                    // 로그용: 지금 메뉴바 점 (attention / done / none)
+    var lastURLFocus: (sid: String, at: TimeInterval)?   // kbusage://focus 연타 거르기 (같은 sid 0.3초)
 
     // ── 소리 (defaults) ──
     //   attentionSound          승인 대기에 **새로 들어가는 순간** 한 번 (기본 Glass, "" 이면 무음).
@@ -2083,6 +2129,12 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var doneBannerSecs: Int { ud.object(forKey: "doneBannerSeconds") == nil ? 10 : ud.integer(forKey: "doneBannerSeconds") }
     var doneMin: Double { ud.object(forKey: "doneNotifyMinMinutes") == nil ? 1 : ud.double(forKey: "doneNotifyMinMinutes") }
     var doneSound: String { ud.string(forKey: "doneSound") ?? "Tink" }
+    //   hideMenuIcon            (기본 NO) YES 면 메뉴바 아이콘만 숨김 — 앱·소리·배너·창 이동·URL 스킴은 그대로.
+    //                           갱신(2초)마다 다시 읽어 바뀌면 적용. 숨기면 승인/완료 점도 안 보인다.
+    var hideIcon: Bool { parseHideMenuIcon(ud.object(forKey: "hideMenuIcon")) }
+    var iconHidden: Bool?                     // 마지막으로 적용한 hideMenuIcon (nil = 아직)
+    // 알림 패널 기준 버튼 — 아이콘을 숨겼으면 nil (패널은 화면 상단 가운데)
+    var toastAnchor: NSStatusBarButton? { item.isVisible ? item.button : nil }
     let banner = DoneBanner()
     let toast = FocusToast()
     let startedAt = Date().timeIntervalSince1970
@@ -2094,12 +2146,41 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         return ICON_VARIANTS.contains(v) ? v : ICON_DEFAULT
     }
 
+    // kbusage://focus 수신. GetURL Apple Event 처리기를 실행 초기(WillFinish)에 직접 건다:
+    // URL 로 앱이 막 켜지는 경우에도 첫 이벤트를 놓치지 않고, 처리 경로가 이 함수 하나로 분명하다.
+    // (이 처리기를 걸면 NSApplication 기본 처리 → application(_:open:) 는 안 불린다 — 둘을 섞지 않음)
+    func applicationWillFinishLaunching(_ n: Notification) {
+        NSAppleEventManager.shared().setEventHandler(
+            self, andSelector: #selector(handleGetURL(_:withReplyEvent:)),
+            forEventClass: AEEventClass(kInternetEventClass), andEventID: AEEventID(kAEGetURL))
+    }
+
+    @objc func handleGetURL(_ ev: NSAppleEventDescriptor, withReplyEvent reply: NSAppleEventDescriptor) {
+        // URL 전체·sid 값은 로그에 안 남긴다 (keyTag 앞 8자만)
+        guard let s = ev.paramDescriptor(forKeyword: AEKeyword(keyDirectObject))?.stringValue,
+              let url = URL(string: s), let sid = parseFocusURL(url) else { logLine("url-focus rejected"); return }
+        let now = ProcessInfo.processInfo.systemUptime
+        if let l = lastURLFocus, l.sid == sid, now - l.at < 0.3 { logLine("url-focus \(keyTag("c:" + sid)) debounced"); return }
+        lastURLFocus = (sid, now)
+        logLine("url-focus \(keyTag("c:" + sid))")
+        if popover.isShown { popover.performClose(nil) }
+        DispatchQueue.main.async { [weak self] in    // 팝오버가 닫힌 뒤에 (행 클릭과 같은 순서)
+            focusSession(sid) { o in
+                let o = o ?? .failed("세션을 찾지 못함")
+                logLine("url-focus \(keyTag("c:" + sid)) outcome=\(o)")
+                // 성공은 조용히 — 부분 성공·실패(권한 필요 등)만 알린다
+                if focusMessage(o).level > 0 { self?.toast.show(o, below: self?.toastAnchor) }
+            }
+        }
+    }
+
     func applicationDidFinishLaunching(_ n: Notification) {
         NSApp.setActivationPolicy(.accessory)
         item.button?.target = self
         item.button?.action = #selector(toggle)
         item.button?.imagePosition = .imageOnly
         item.length = ICON_W + 8   // 아이콘만 — 폭 고정, 안 흔들림
+        applyIconVisibility()
 
         view.onSize = { [weak self] sz in
             guard let self = self else { return }
@@ -2121,8 +2202,10 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     FOCUS_ACK, object: nil, userInfo: ["req": req, "ok": ok], deliverImmediately: true)
             }
             logLine("focus-request \(keyTag("c:" + sid))")
-            guard let it = itemForSession(String(sid.prefix(64))) else { logLine("focus-request no-session"); ack(false); return }
-            focus(it) { o in ack(o.reachedFront) }
+            focusSession(sid) { o in
+                guard let o else { logLine("focus-request no-session"); ack(false); return }
+                ack(o.reachedFront)
+            }
         }
 
         // 행 클릭(마우스·키보드·VoiceOver 누르기 공통): 팝오버를 닫고 창으로 간 뒤, 결과를 메뉴바 아래에 잠깐 보인다
@@ -2133,7 +2216,7 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             DispatchQueue.main.async {               // 팝오버가 닫힌 뒤에
                 focus(it) { o in
                     logLine("focus \(keyTag(it.key)) outcome=\(o)")
-                    self?.toast.show(o, below: self?.item.button)
+                    self?.toast.show(o, below: self?.toastAnchor)
                 }
             }
         }
@@ -2211,11 +2294,23 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         doneShown.removeAll()                    // 열어서 본 완료 강조는 닫으면 끝
     }
 
+    // hideMenuIcon 적용 (바뀌었을 때만). isVisible 은 AppKit 이 "NSStatusItem Visible …" 으로 저장하므로
+    // 첫 적용은 값과 상관없이 늘 명시적으로 넣는다 (예전에 숨긴 게 남아 있어도 NO 면 다시 보이게).
+    func applyIconVisibility() {
+        let h = hideIcon
+        guard h != iconHidden else { return }
+        iconHidden = h
+        if h && popover.isShown { popover.performClose(nil) }   // 숨길 버튼에 붙은 팝오버는 닫는다
+        item.isVisible = !h
+        logLine("menu-icon \(h ? "hidden" : "visible")")
+    }
+
     @objc func toggle() {
         guard let b = item.button else { return }
         if popover.isShown {
             popover.performClose(nil)
         } else {
+            guard item.isVisible, b.window != nil else { return }   // 아이콘 숨김이면 팝오버를 붙일 곳이 없다
             let snap = self.snap()
             acked.formUnion(attentionKeys(snap))     // 팝오버로 봤으니 지금 대기들은 펄스 정지
             seeDoneInPopover()                       // 완료도 본 것으로 → 메뉴바 점 끔, 행 강조는 닫을 때까지
@@ -2240,6 +2335,7 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     func refresh() {
+        applyIconVisibility()
         let s = snap()
         sounds(s)                                  // 완료 감지 → doneUnseen
         pruneDone(s)
@@ -2466,6 +2562,17 @@ if argv.count >= 3 && argv[1] == "--render-icon" {
 }
 if argv.count >= 3 && argv[1] == "--focus" {
     exit(requestFocusCLI(argv[2]))
+}
+if argv.count >= 3 && argv[1] == "--parse-url" {
+    // 진단: kbusage:// URL 검증만 (권한·GUI 없음). 맞으면 "ok <sid 길이>"(값은 안 찍음) exit 0, 아니면 "reject" exit 1
+    if let u = URL(string: argv[2]), let sid = parseFocusURL(u) { print("ok \(sid.utf8.count)"); exit(0) }
+    print("reject")
+    exit(1)
+}
+if argv.count >= 2 && argv[1] == "--icon-hidden" {
+    // 진단: hideMenuIcon 설정 해석 결과만 (읽기 전용). "hidden" / "visible"
+    print(parseHideMenuIcon(UserDefaults.standard.object(forKey: "hideMenuIcon")) ? "hidden" : "visible")
+    exit(0)
 }
 if argv.count >= 3 && argv[1] == "--ae-ask", let pid = Int32(argv[2]) {
     // 진단: 메뉴바 앱처럼 accessory 로 떠서 active 가 된 뒤 권한을 묻는다 (팝업이 뜰 수 있음)

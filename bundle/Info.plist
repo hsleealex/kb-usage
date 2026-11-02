@@ -20,5 +20,15 @@
   <key>LSUIElement</key><true/>
   <key>NSAppleEventsUsageDescription</key>
   <string>세션 목록에서 누른 세션의 Ghostty 창(탭)을 앞으로 가져오려고 Ghostty 에 창 목록을 묻고 그 창으로 초점을 옮깁니다.</string>
+  <!-- kbusage://focus?sid=<session_id> — 그 세션 창을 앞으로 (샌드박스 앱도 NSWorkspace.open 한 번으로 부를 수 있게).
+       다른 동작은 없다. 검증 규칙은 menubar.swift 의 parseFocusURL. -->
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key><string>kb-usage focus</string>
+      <key>CFBundleURLSchemes</key><array><string>kbusage</string></array>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+    </dict>
+  </array>
 </dict>
 </plist>

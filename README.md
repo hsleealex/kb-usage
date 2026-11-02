@@ -35,7 +35,7 @@ XENEON EDGE 전용. → macOS + keyboard LCD 조합은 경로가 없어 메뉴�
 | 파일 | 역할 |
 |---|---|
 | `menubar.swift` / `kb-usage-menubar` | 메뉴바 앱 (AppKit, 의존성 0). 빌드는 `./install.sh` (`Info.plist` 를 실행 파일에 박는다 — "Ghostty 제어" 권한 설명) |
-| `bundle/Info.plist` | `KbUsage.app` 의 Info.plist 이자 단독 실행 파일에 박는 plist: 번들 id `kb-usage-menubar`(= defaults 도메인), Apple Events 권한 설명 |
+| `bundle/Info.plist` | `KbUsage.app` 의 Info.plist 이자 단독 실행 파일에 박는 plist: 번들 id `kb-usage-menubar`(= defaults 도메인), Apple Events 권한 설명, URL 스킴 `kbusage://` (`CFBundleURLTypes`) |
 | `bundle/AppIcon.icns` | `KbUsage.app` 앱 아이콘 (원본 `bundle/AppIcon-1024.png` → `sips` 로 iconset → `iconutil -c icns`) |
 | `statusline.py` | Claude Code statusLine 훅. `rate_limits` → `rate_limits.json`. `model_usage.py` 스폰 |
 | `rate_limits.json` | 최신 스냅샷 (`{rate_limits, captured_at}`) |
@@ -46,7 +46,7 @@ XENEON EDGE 전용. → macOS + keyboard LCD 조합은 경로가 없어 메뉴�
 | `codex_usage.py` | Codex 한도·최근 스레드 → `codex_limits.json` (`--daemon` / `--print`) |
 | `codex_limits.json` | Codex 스냅샷 (`{ok, error, checked_at, captured_at, rate_limits, threads}`) |
 | `usage_stats.py` | 별도 유틸 — `~/.claude` 로그로 **누적 토큰·비용** 집계 (`--pretty`) |
-| `install.sh` / `uninstall.sh` | 메뉴바 앱 빌드 + launchd 상주 등록/해제 |
+| `install.sh` / `uninstall.sh` | 메뉴바 앱 빌드 + LaunchServices 등록(`lsregister -f`, URL 스킴용) + launchd 상주 등록/해제 |
 
 ## 메뉴바 아이콘
 
@@ -72,6 +72,22 @@ launchctl kickstart -k gui/$(id -u)/com.gaedongi.claude-usage-menubar
 | 1 | **굵기 (기본)** — 80%+ 인 링이 굵어진다 |
 | 2 | 외곽선 — 그 서비스 링 바깥에 얇은 테두리 (다크=흰, 라이트=검, 95%+ 장미색) |
 | 3 | 글로우 — 그 서비스 색으로 은은한 번짐 |
+
+**아이콘만 숨기기** (다른 곳 — 예: 노치 앱 사용량 탭 — 에서 한도를 볼 때). 앱은 계속 떠 있고
+세션 창 이동(`--focus`·`kbusage://focus`)·소리·승인/완료 알림 배너는 그대로 동작한다.
+**숨기면 메뉴바의 승인 대기·완료 점과 팝오버는 안 보인다** (붙을 아이콘이 없음). 창 이동 결과
+알림 패널은 화면 상단 가운데에 뜬다. 실행 중에 바꿔도 다음 갱신(2초) 때 적용한다 — 재시작 불필요
+(안 먹으면 위 `kickstart`).
+
+```bash
+defaults write kb-usage-menubar hideMenuIcon -bool YES   # 숨김 (기본 NO = 보임)
+defaults delete kb-usage-menubar hideMenuIcon            # 되돌리기
+./kb-usage-menubar --icon-hidden                         # 지금 설정 해석 결과 (hidden / visible)
+```
+
+AppKit 이 표시 여부를 `NSStatusItem VisibleCC Item-0` 로 따로 저장하지만, 앱은 시작할 때마다
+`hideMenuIcon` 값으로 다시 맞춘다. 이 옵션이 없는 옛 빌드로 되돌리기 전에는 먼저
+`defaults delete kb-usage-menubar hideMenuIcon` 후 한 번 실행해 두면 아이콘이 다시 보이는 상태로 저장된다.
 
 ## Codex 한도
 
@@ -211,6 +227,17 @@ python3 codex_usage.py --print    # 한 번 조회 → codex plus: 5h 24%  7d 4%
   세션의 Ghostty 창(탭)까지 골라 올린다 (ack 를 3초 기다림, 앱이 없거나 실패하면 exit 1 →
   팝업 쪽이 자기 방식으로 폴백). **Ghostty 제어 권한이 이 앱 한 곳에만 필요**하도록 실제
   제어는 상주 앱이 한다.
+- **URL 스킴 `kbusage://focus?sid=<session_id>`**: 프로세스를 띄우거나 Apple Events 를 못 쓰는
+  샌드박스 앱(예: 노치 앱의 사용량 탭)도 `NSWorkspace.shared.open(URL)` 한 번으로 그 Claude
+  세션의 Ghostty 창을 앞으로 가져올 수 있다 (새 권한 없음). 상주 앱이 GetURL Apple Event 로 받아
+  `--focus` 와 같은 경로(`focusSession` → `focus`)를 탄다. **동작은 "그 세션 창 앞으로" 하나뿐**이고
+  다른 host·경로는 무시한다. 검증(`parseFocusURL`): 스킴 `kbusage`(대소문자 무시), host 정확히
+  `focus`, 경로·포트·사용자·fragment 없음, 쿼리는 `sid` 하나만(중복·다른 키 거부), 값은
+  `[A-Za-z0-9._-]{1,64}`. 거부되면 로그에 `url-focus rejected` 만 남긴다 (URL·sid 값 안 남김).
+  같은 sid 가 0.3초 안에 또 오면 무시. 성공은 조용히, 부분 성공·실패(권한 필요·세션 없음 등)만
+  메뉴바 아래 알림. 검증만 시험: `./kb-usage-menubar --parse-url '<url>'` → `ok <sid 길이>`
+  (exit 0) / `reject` (exit 1). 스킴 라우팅은 `install.sh` 의 `lsregister -f KbUsage.app` 이 맡는다.
+  Codex CLI 행은 창 제목 정보가 없어 이 URL 대상이 아니다 (Claude 세션 id 용).
 - **처리하면 팝업 자동 해제**: (폴백으로 팝업이 떴을 때) `session_state.py` 가 attention →
   working/idle(또는 세션 종료)로 풀리는 순간에만 `alerter --remove cc-<id>`
   (·`terminal-notifier -remove`)를 분리된 프로세스로 띄운다. 평소 이벤트는 비교 한 번뿐.
