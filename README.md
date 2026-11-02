@@ -45,6 +45,7 @@ XENEON EDGE 전용. → macOS + keyboard LCD 조합은 경로가 없어 메뉴�
 | `session_state.py` | Claude Code 상태 훅 → `sessions/<id>.state.json` (상태·도구·todo·터미널 pid) |
 | `codex_usage.py` | Codex 한도·최근 스레드 → `codex_limits.json` (`--daemon` / `--print`) |
 | `codex_limits.json` | Codex 스냅샷 (`{ok, error, checked_at, captured_at, rate_limits, threads}`) |
+| `alerts.json` | 메뉴바 앱이 쓰는 **지금 점 상태** (승인 대기·안 본 완료 sid 목록) — 다른 앱이 따라 그리는 용도. 아래 "알림 상태 내보내기" |
 | `usage_stats.py` | 별도 유틸 — `~/.claude` 로그로 **누적 토큰·비용** 집계 (`--pretty`) |
 | `install.sh` / `uninstall.sh` | 메뉴바 앱 빌드 + LaunchServices 등록(`lsregister -f`, URL 스킴용) + launchd 상주 등록/해제 |
 
@@ -75,7 +76,8 @@ launchctl kickstart -k gui/$(id -u)/com.gaedongi.claude-usage-menubar
 
 **아이콘만 숨기기** (다른 곳 — 예: 노치 앱 사용량 탭 — 에서 한도를 볼 때). 앱은 계속 떠 있고
 세션 창 이동(`--focus`·`kbusage://focus`)·소리·승인/완료 알림 배너는 그대로 동작한다.
-**숨기면 메뉴바의 승인 대기·완료 점과 팝오버는 안 보인다** (붙을 아이콘이 없음). 창 이동 결과
+**숨기면 메뉴바의 승인 대기·완료 점과 팝오버는 안 보인다** (붙을 아이콘이 없음 — 같은 점 상태는
+`alerts.json` 으로 계속 나가니 다른 앱이 그릴 수 있다, 아래 "알림 상태 내보내기"). 창 이동 결과
 알림 패널은 화면 상단 가운데에 뜬다. 실행 중에 바꿔도 다음 갱신(2초) 때 적용한다 — 재시작 불필요
 (안 먹으면 위 `kickstart`).
 
@@ -295,6 +297,26 @@ defaults write kb-usage-menubar doneBannerSeconds 0          # 배너 유지 시
 설정은 다음 완료부터 바로 먹는다 (재시작 불필요). menubar.log 에 `done-notify` / `done-skip
 reason=short|front|off` / `dot attention|done|none` / `done-dot clear reason=click|popover|front|resumed|gone`
 (/ 배너를 켰으면 `done-banner post|result`) 가 남는다.
+
+## 알림 상태 내보내기 (`alerts.json`)
+
+메뉴바 점을 만드는 **바로 그 두 집합**을 `alerts.json` 으로 내보낸다 — 메뉴바 아이콘을 숨기고 다른 곳
+(예: 노치 앱)에서 점을 보고 싶을 때, 그 앱이 "언제 알릴지" 조건을 다시 구현하지 않고 그리기만 하게.
+
+```json
+{"v":1,"updated_at":1793400200.7,
+ "attention":[{"sid":"…","since":1793400000.2}],
+ "done":[{"sid":"…","done_at":1793400100.5,"took":192}]}
+```
+
+- `attention` = 승인 대기 세션 (메뉴바 호박 점과 같은 거르기), `done` = 아직 안 본 작업 완료 (세이지 점과 같은
+  장부 — 위 "사라지는 때"의 모든 경로에서 같이 빠진다). 승인 대기가 있으면 승인이 우선인 건 읽는 쪽 몫.
+- 세션 제목·메시지는 안 넣는다. 읽는 쪽이 `sessions/<sid>.json` 에서 찾는다. sid 는 `[A-Za-z0-9._-]{1,64}` 만.
+- 집합이 바뀌면 다음 갱신(2초) 때 바로, 안 바뀌어도 **30초마다** `updated_at` 만 새로 쓴다 (heartbeat).
+  읽는 쪽은 90초 넘게 안 바뀌었거나 파일이 없거나 `v` 를 모르면 알림 없음으로 보면 된다 (앱이 죽었을 때 점이
+  남지 않게). 같은 폴더 임시 파일 → rename 으로 원자적으로 쓴다.
+- 메뉴바 아이콘 숨김(`hideMenuIcon`)과 상관없이 늘 쓴다. 쓰기만 하고 읽지 않는다 (git 에는 안 올라감).
+- 시험: `./kb-usage-menubar --selftest-alerts <임시 폴더>` — 순수 함수 시험만 (GUI·설정 무접촉, 쓰기는 그 폴더 안에서만).
 
 ## 데이터 갱신
 

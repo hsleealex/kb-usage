@@ -9,6 +9,7 @@
 //         session_state.py → sessions/<id>.state.json              (Claude 상태 훅)
 //         model_usage.py  → model_usage.json
 //         codex_usage.py --daemon → codex_limits.json  (이 앱이 자식으로 띄움)
+// 내보냄: alerts.json — 메뉴바 점과 같은 승인 대기·안 본 완료 집합 (노치 앱 등이 읽음, exportAlerts)
 //
 // 빌드:  swiftc -O menubar.swift -o kb-usage-menubar \
 //          -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker bundle/Info.plist
@@ -1875,6 +1876,113 @@ func doneClearReason(alive: Bool, state: String?, term: Int32?, front: Int32?) -
     return nil
 }
 
+// ── 안 본 완료 장부 (순수) ─────────────────────────────
+// 메뉴바 세이지 점 · 팝오버 행 강조 · alerts.json 의 done 이 모두 이 장부 하나만 본다 (어긋남 방지).
+// App 은 언제 고칠지(소리 판정·폴링·팝오버)만 정하고, 무엇이 남는지는 여기서 정한다.
+struct DoneMark: Equatable { var at: Double; var took: Double }   // done_at, 이번 턴 걸린 시간(초)
+
+struct DoneBook: Equatable {
+    private(set) var unseen: [String: DoneMark] = [:]   // 완료 알림을 냈고 아직 안 본 세션 — 메뉴바 점
+    private(set) var shown = Set<String>()              // 팝오버를 열어 본 완료 — 팝오버가 닫힐 때까지만 행 강조
+
+    mutating func mark(_ sid: String, _ m: DoneMark) { unseen[sid] = m }
+
+    // 그 세션 표시를 지움 (행 클릭 · doneClearReason). 반환 = 실제로 지운 게 있었나 (로그용)
+    @discardableResult
+    mutating func clear(_ sid: String) -> Bool {
+        let had = unseen.removeValue(forKey: sid) != nil
+        let wasShown = shown.remove(sid) != nil
+        return had || wasShown
+    }
+
+    // 팝오버가 열림 = 본 것: 점에서 빼고 행 강조로만. 반환 = 옮긴 sid (정렬, 로그용)
+    mutating func seeAll() -> [String] {
+        let moved = unseen.keys.sorted()
+        shown.formUnion(moved)
+        unseen.removeAll()
+        return moved
+    }
+
+    mutating func popoverClosed() { shown.removeAll() }
+
+    // 지금 지울 것들 (doneClearReason: 세션 종료 / 다시 작업 / 그 창이 맨 앞). 정렬된 (sid, 이유)
+    func clearReasons(_ sessions: [SessionRow], front: Int32?) -> [(sid: String, reason: String)] {
+        let bySid = Dictionary(sessions.map { ($0.sid, $0) }, uniquingKeysWith: { a, _ in a })
+        return Set(unseen.keys).union(shown).sorted().compactMap { sid in
+            let r = bySid[sid]
+            return doneClearReason(alive: r != nil, state: r?.state, term: r?.termPid, front: front).map { (sid, $0) }
+        }
+    }
+}
+
+// 승인 대기 세션 — 메뉴바 점(attentionKeys)과 alerts.json 이 같은 거르기를 쓴다
+func attentionRows(_ sessions: [SessionRow]) -> [SessionRow] { sessions.filter { $0.state == "attention" } }
+
+// ── alerts.json (노치 앱 등 다른 앱이 점을 그대로 따라 그리게) ──
+// 메뉴바 점을 만드는 바로 그 두 집합을 내보낸다. 언제 알릴지(1분·맨 앞 창·done_at 1회·시작 기준선)는
+// 여기서만 판단하고, 읽는 쪽은 그리기만 한다. 제목·메시지는 안 넣는다 (sid 로 sessions/<sid>.json 을 찾게).
+//   {"v":1,"updated_at":<epoch>,"attention":[{"sid","since"}],"done":[{"sid","done_at","took"}]}
+// 집합이 바뀌면 바로, 안 바뀌어도 ALERTS_HEARTBEAT 초마다 updated_at 만 새로 쓴다 (읽는 쪽은 90초 넘게
+// 안 바뀌면 이 앱이 죽은 것으로 보고 점을 지운다). 메뉴바 아이콘 숨김과 상관없이 늘 쓴다.
+let ALERTS_PATH = ("~/developer/kb-usage/alerts.json" as NSString).expandingTildeInPath
+let ALERTS_HEARTBEAT = 30.0
+
+struct AlertsPayload: Equatable {
+    struct Attn: Equatable { var sid: String; var since: Double }
+    struct Done: Equatable { var sid: String; var doneAt: Double; var took: Double }
+    var attention: [Attn] = []
+    var done: [Done] = []
+}
+
+// sid 는 kbusage://focus 와 같은 규칙만 내보낸다: [A-Za-z0-9._-]{1,64}
+func validAlertSid(_ sid: String) -> Bool {
+    (1...64).contains(sid.utf8.count) && sid.utf8.allSatisfy { b in
+        (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A)
+            || b == 0x2E || b == 0x5F || b == 0x2D
+    }
+}
+
+// (순수) 지금 점 상태 → 내보낼 집합. 순서 고정(시각, sid) — 같은 상태면 같은 값.
+func alertsPayload(_ sessions: [SessionRow], _ book: DoneBook) -> AlertsPayload {
+    var attn: [String: Double] = [:]
+    for r in attentionRows(sessions) where validAlertSid(r.sid) {
+        let since = r.stateSince ?? 0
+        attn[r.sid] = min(attn[r.sid] ?? since, since)
+    }
+    var p = AlertsPayload()
+    p.attention = attn.map { AlertsPayload.Attn(sid: $0.key, since: $0.value) }
+        .sorted { $0.since != $1.since ? $0.since < $1.since : $0.sid < $1.sid }
+    p.done = book.unseen.filter { validAlertSid($0.key) }
+        .map { AlertsPayload.Done(sid: $0.key, doneAt: $0.value.at, took: max(0, $0.value.took)) }
+        .sorted { $0.doneAt != $1.doneAt ? $0.doneAt < $1.doneAt : $0.sid < $1.sid }
+    return p
+}
+
+func alertsJSON(_ p: AlertsPayload, updatedAt: Double) -> Data {
+    let o: [String: Any] = [
+        "v": 1,
+        "updated_at": updatedAt,
+        "attention": p.attention.map { ["sid": $0.sid, "since": $0.since] as [String: Any] },
+        "done": p.done.map { ["sid": $0.sid, "done_at": $0.doneAt, "took": $0.took] as [String: Any] },
+    ]
+    return (try? JSONSerialization.data(withJSONObject: o, options: [.sortedKeys])) ?? Data()
+}
+
+// (순수) 쓸지: 처음 / 집합이 바뀜 / heartbeat 지남
+func alertsShouldWrite(last: AlertsPayload?, lastAt: Double, cur: AlertsPayload, now: Double) -> Bool {
+    guard let last else { return true }
+    return last != cur || now - lastAt >= ALERTS_HEARTBEAT
+}
+
+// 원자적 쓰기: 같은 폴더 임시 파일 → rename. 읽는 쪽이 반쯤 쓴 파일을 보지 않는다.
+func writeAlertsFile(_ data: Data, path: String) -> Bool {
+    guard !data.isEmpty else { return false }
+    let tmp = path + ".tmp"
+    guard FileManager.default.createFile(atPath: tmp, contents: data) else { return false }
+    if rename(tmp, path) != 0 { try? FileManager.default.removeItem(atPath: tmp); return false }
+    return true
+}
+
 final class DoneBanner {
     private var procs: [String: Process] = [:]     // sid → 떠 있는 alerter (같은 세션 새 배너면 이전 것 정리)
 
@@ -2104,8 +2212,10 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     var prevState: [String: String] = [:]
     var workingSince: [String: Double] = [:]
     var doneSeen: [String: Double] = [:]
-    var doneUnseen: [String: Double] = [:]   // 완료 알림을 냈고 아직 안 본 세션 (sid → done_at) — 메뉴바 점
-    var doneShown = Set<String>()            // 팝오버를 열어 본 완료 — 팝오버가 닫힐 때까지만 행 강조 유지
+    var doneBook = DoneBook()                // 안 본 완료 (메뉴바 점 · 행 강조 · alerts.json done)
+    var alertsLast: AlertsPayload?           // 마지막으로 쓴 alerts.json 집합 (nil = 아직 안 씀)
+    var alertsLastAt = 0.0
+    var alertsFailed = false                 // 쓰기 실패 로그는 상태가 바뀔 때만
     var attnSeen: Set<String>?          // 지난 갱신 때의 승인 대기 키 (nil = 아직 기준선 없음)
     var lastAttnSound = 0.0
     var dotKind = ""                    // 로그용: 지금 메뉴바 점 (attention / done / none)
@@ -2291,7 +2401,7 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     // 바깥 클릭으로 닫혀도(transient) 1초 타이머를 끈다
     func popoverDidClose(_ n: Notification) {
         fastTimer?.invalidate(); fastTimer = nil
-        doneShown.removeAll()                    // 열어서 본 완료 강조는 닫으면 끝
+        doneBook.popoverClosed()                 // 열어서 본 완료 강조는 닫으면 끝
     }
 
     // hideMenuIcon 적용 (바뀌었을 때만). isVisible 은 AppKit 이 "NSStatusItem Visible …" 으로 저장하므로
@@ -2315,8 +2425,9 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             acked.formUnion(attentionKeys(snap))     // 팝오버로 봤으니 지금 대기들은 펄스 정지
             seeDoneInPopover()                       // 완료도 본 것으로 → 메뉴바 점 끔, 행 강조는 닫을 때까지
             updateAttentionDot(snap)
+            exportAlerts(snap)                       // 팝오버로 본 완료는 alerts.json 에서도 바로 빠진다
             view.maxHeight = popoverMaxH()
-            view.apply(snap, done: doneShown)
+            view.apply(snap, done: doneBook.shown)
             view.relayout()
             popover.contentSize = view.totalSize
             popover.animates = !reduceMotion()
@@ -2339,10 +2450,11 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let s = snap()
         sounds(s)                                  // 완료 감지 → doneUnseen
         pruneDone(s)
-        if popover.isShown { seeDoneInPopover(); view.apply(s, done: doneShown) }   // 닫혀 있을 땐 아이콘만
+        if popover.isShown { seeDoneInPopover(); view.apply(s, done: doneBook.shown) }   // 닫혀 있을 땐 아이콘만
         var d = iconData(s, Date().timeIntervalSince1970)
         d.drawDot = false                          // 점은 레이어로
         updateAttentionDot(s)
+        exportAlerts(s)                            // 점과 같은 두 집합 → alerts.json (아이콘 숨김과 무관)
         // 아이콘도 값이 같으면 다시 안 만든다
         let key = "\(variant)|\(d.five ?? -1)|\(d.seven ?? -1)|\(d.stale)|\(d.cxFive ?? -1)|\(d.cxSeven ?? -1)|\(d.cxDown)|\(d.attention)"
         if key != lastIcon {
@@ -2351,12 +2463,27 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             item.button?.image?.isTemplate = false
             item.button?.title = ""
         }
-        let v = iconAccessibilityValue(d, done: !doneUnseen.isEmpty)
+        let v = iconAccessibilityValue(d, done: !doneBook.unseen.isEmpty)
         if v != a11yValue { a11yValue = v; item.button?.setAccessibilityValue(v) }
     }
 
     func attentionKeys(_ s: Snap) -> Set<String> {
-        Set(s.sessions.filter { $0.state == "attention" }.map { "\($0.sid)@\(Int($0.stateSince ?? 0))" })
+        Set(attentionRows(s.sessions).map { "\($0.sid)@\(Int($0.stateSince ?? 0))" })
+    }
+
+    // 메뉴바 점과 같은 두 집합(attentionRows · doneBook.unseen)을 alerts.json 으로. 바뀌면 바로, 아니면 heartbeat
+    func exportAlerts(_ s: Snap) {
+        let now = Date().timeIntervalSince1970
+        let p = alertsPayload(s.sessions, doneBook)
+        guard alertsShouldWrite(last: alertsLast, lastAt: alertsLastAt, cur: p, now: now) else { return }
+        if writeAlertsFile(alertsJSON(p, updatedAt: now), path: ALERTS_PATH) {
+            if p != alertsLast { logLine("alerts attention=\(p.attention.count) done=\(p.done.count)") }
+            alertsLast = p; alertsLastAt = now
+            if alertsFailed { alertsFailed = false; logLine("alerts write ok") }
+        } else if !alertsFailed {
+            alertsFailed = true
+            logLine("alerts write failed")
+        }
     }
 
     // 승인 대기 있으면 점. 아직 안 본 대기가 있으면 은은한 펄스 (동작 줄이기면 정적).
@@ -2367,12 +2494,12 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let keys = attentionKeys(s)
         acked.formIntersection(keys)
         let attn = !keys.isEmpty
-        let done = !attn && !doneUnseen.isEmpty && !popover.isShown
+        let done = !attn && !doneBook.unseen.isEmpty && !popover.isShown
         let show = attn || done
         let pulse = (attn ? !keys.subtracting(acked).isEmpty && !popover.isShown : done)
             && !reduceMotion()
         let kind = attn ? "attention" : done ? "done" : "none"
-        if kind != dotKind { logLine("dot \(kind)" + (done ? " \(doneUnseen.keys.map { keyTag("c:" + $0) }.sorted().joined(separator: ","))" : "")); dotKind = kind }
+        if kind != dotKind { logLine("dot \(kind)" + (done ? " \(doneBook.unseen.keys.map { keyTag("c:" + $0) }.sorted().joined(separator: ","))" : "")); dotKind = kind }
         CATransaction.begin(); CATransaction.setDisableActions(true)
         attnDot.isHidden = !show
         if show {
@@ -2450,7 +2577,7 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 } else {
                     play(doneSound)
                     logLine("done-notify \(tag) took=\(Int(took))s sound=\(doneSound.isEmpty ? "(none)" : doneSound) dot=\(doneDotOn) banner=\(doneBannerOn)")
-                    if doneDotOn { doneUnseen[r.sid] = done }
+                    if doneDotOn { doneBook.mark(r.sid, DoneMark(at: done, took: took)) }
                     if doneBannerOn { banner.post(sid: r.sid, title: doneTitle(r), body: doneBody(r, took: took), seconds: doneBannerSecs) }
                 }
             }
@@ -2461,29 +2588,17 @@ final class App: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     // 안 본 완료 정리: 세션 종료 / 다시 작업 / 그 창이 맨 앞 (doneClearReason)
     func pruneDone(_ s: Snap) {
-        guard !doneUnseen.isEmpty || !doneShown.isEmpty else { return }
-        let front = frontPid()
-        let bySid = Dictionary(s.sessions.map { ($0.sid, $0) }, uniquingKeysWith: { a, _ in a })
-        for sid in Set(doneUnseen.keys).union(doneShown) {
-            let r = bySid[sid]
-            if let why = doneClearReason(alive: r != nil, state: r?.state, term: r?.termPid, front: front) {
-                clearDone(sid, reason: why)
-            }
-        }
+        guard !doneBook.unseen.isEmpty || !doneBook.shown.isEmpty else { return }
+        for c in doneBook.clearReasons(s.sessions, front: frontPid()) { clearDone(c.sid, reason: c.reason) }
     }
 
     func clearDone(_ sid: String, reason: String) {
-        let had = doneUnseen.removeValue(forKey: sid) != nil
-        let shown = doneShown.remove(sid) != nil
-        if had || shown { logLine("done-dot clear \(keyTag("c:" + sid)) reason=\(reason)") }
+        if doneBook.clear(sid) { logLine("done-dot clear \(keyTag("c:" + sid)) reason=\(reason)") }
     }
 
     // 팝오버가 열려 있으면 완료는 본 것: 메뉴바 점에서 빼고 행 강조는 닫힐 때까지 유지
     func seeDoneInPopover() {
-        guard !doneUnseen.isEmpty else { return }
-        for sid in doneUnseen.keys.sorted() { logLine("done-dot clear \(keyTag("c:" + sid)) reason=popover") }
-        doneShown.formUnion(doneUnseen.keys)
-        doneUnseen.removeAll()
+        for sid in doneBook.seeAll() { logLine("done-dot clear \(keyTag("c:" + sid)) reason=popover") }
     }
 
     // 배너 제목 = 세션 목록 행 제목과 같은 표기 ("개똥이  ·  세션 이름")
@@ -2554,8 +2669,136 @@ func renderIconSheet(_ out: String) {
     try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: out))
 }
 
+// ── alerts.json 순수 함수 시험 (--selftest-alerts <임시 폴더>) ──
+// GUI·설정(defaults)·실제 sessions/·실제 alerts.json 무접촉. 파일 쓰기는 넘겨받은 임시 폴더 안에서만.
+func alertsSelfTest(_ dir: String) -> Int32 {
+    var pass = 0, fail = 0
+    func check(_ c: Bool, _ name: String) {
+        if c { pass += 1; print("  ok   \(name)") } else { fail += 1; print("  FAIL \(name)") }
+    }
+    func row(_ sid: String, _ state: String?, since: Double? = nil, term: Int32? = nil) -> SessionRow {
+        var r = SessionRow(name: "n", agent: nil, model: nil, ctxPct: nil, ctxSize: nil, cost: nil,
+                           startedAt: 0, updatedAt: 0, sid: sid)
+        r.state = state; r.stateSince = since; r.termPid = term
+        return r
+    }
+    print("[1] sid 규칙")
+    check(validAlertSid("abc-123_X.y") && validAlertSid(String(repeating: "a", count: 64)), "valid sids")
+    for (s, why) in [("", "empty"), (String(repeating: "a", count: 65), "65 chars"), ("a b", "space"),
+                     ("../x", "slash"), ("a;b", "semicolon"), ("한글", "non-ascii"), ("a\"b", "quote")] {
+        check(!validAlertSid(s), "reject \(why)")
+    }
+    print("[2] 승인 집합 = 메뉴바 점과 같은 거르기")
+    var sessions = [row("A", "attention", since: 200), row("B", "working", since: 100),
+                    row("C", "attention", since: 100), row("bad sid", "attention", since: 50), row("D", "idle")]
+    var book = DoneBook()
+    var p = alertsPayload(sessions, book)
+    check(p.attention.map(\.sid) == ["C", "A"] && p.attention.map(\.since) == [100, 200], "attention only, sorted by since")
+    check(!p.attention.contains { $0.sid == "bad sid" }, "invalid sid not exported")
+    check(attentionRows(sessions).count == 3 && Set(attentionRows(sessions).map(\.sid)).isSuperset(of: p.attention.map(\.sid)),
+          "same filter as dot (attentionRows)")
+    check(p.done.isEmpty, "no done yet")
+    sessions[1] = row("B", "attention", since: 300)          // B 승인 대기 진입
+    check(alertsPayload(sessions, book).attention.map(\.sid) == ["C", "A", "B"], "new attention added")
+    sessions[0] = row("A", "working", since: 400)            // A 승인 처리 → 다시 작업
+    check(alertsPayload(sessions, book).attention.map(\.sid) == ["C", "B"], "attention resolved → removed")
+    let dup = [row("E", "attention", since: 9), row("E", "attention", since: 5)]
+    check(alertsPayload(dup, book).attention.map(\.since) == [5], "duplicate sid → one entry (earliest)")
+
+    print("[3] 완료 집합 = doneBook.unseen, 점이 지워지는 경로마다 같이 줄어듦")
+    sessions = [row("F", "idle", term: 900), row("G", "idle", term: 901), row("H", "idle", term: 902),
+                row("I", "idle", term: 903), row("J", "idle", term: 904)]
+    for (i, sid) in ["F", "G", "H", "I", "J"].enumerated() { book.mark(sid, DoneMark(at: 1000 + Double(i), took: 61 + Double(i))) }
+    book.mark("bad/sid", DoneMark(at: 1, took: 1))
+    p = alertsPayload(sessions, book)
+    check(p.done.map(\.sid) == ["F", "G", "H", "I", "J"] && p.done[0].took == 61 && p.done[0].doneAt == 1000,
+          "done = unseen (sorted by done_at, took kept, bad sid dropped)")
+    check(book.clearReasons(sessions, front: 1).filter { $0.sid != "bad/sid" }.isEmpty, "idle + not front → stays")
+    // 행 클릭
+    check(book.clear("F") && !alertsPayload(sessions, book).done.contains { $0.sid == "F" }, "click → removed")
+    check(!book.clear("F"), "click again → nothing to clear")
+    // 그 창이 맨 앞
+    var cr = book.clearReasons(sessions, front: 901)
+    check(cr.contains { $0.sid == "G" && $0.reason == "front" }, "front window → reason front")
+    for c in cr { book.clear(c.sid) }
+    check(!alertsPayload(sessions, book).done.contains { $0.sid == "G" }, "front → removed")
+    // 다시 작업 / 승인 대기
+    sessions[2] = row("H", "working", term: 902)
+    sessions[3] = row("I", "attention", since: 2000, term: 903)
+    cr = book.clearReasons(sessions, front: nil)
+    check(cr.filter { $0.sid == "H" || $0.sid == "I" }.map(\.reason) == ["resumed", "resumed"], "working/attention again → resumed")
+    for c in cr { book.clear(c.sid) }
+    p = alertsPayload(sessions, book)
+    check(!p.done.contains { $0.sid == "H" || $0.sid == "I" } && p.attention.map(\.sid) == ["I"],
+          "resumed → removed from done; I now in attention")
+    // 세션 종료
+    sessions.removeAll { $0.sid == "J" }
+    cr = book.clearReasons(sessions, front: nil)
+    check(cr.contains { $0.sid == "J" && $0.reason == "gone" }, "session gone → reason gone")
+    for c in cr { book.clear(c.sid) }
+    check(alertsPayload(sessions, book).done.isEmpty, "gone → removed (done empty)")
+    // 팝오버 열기
+    book.mark("K", DoneMark(at: 3000, took: 90))
+    sessions.append(row("K", "idle", term: 905))
+    check(alertsPayload(sessions, book).done.map(\.sid) == ["K"], "K done")
+    check(book.seeAll() == ["K"] && alertsPayload(sessions, book).done.isEmpty && book.shown == ["K"],
+          "popover open → done empty, row highlight kept")
+    book.popoverClosed()
+    check(book.shown.isEmpty && book.unseen.isEmpty, "popover closed → highlight gone")
+
+    print("[4] 쓰기 시점 (바뀌면 바로 · 아니면 heartbeat \(Int(ALERTS_HEARTBEAT))초)")
+    let a = AlertsPayload(attention: [.init(sid: "A", since: 1)], done: [])
+    check(alertsShouldWrite(last: nil, lastAt: 0, cur: AlertsPayload(), now: 10), "first → write (even empty)")
+    check(!alertsShouldWrite(last: a, lastAt: 100, cur: a, now: 100 + ALERTS_HEARTBEAT - 0.5), "same set within 30s → skip")
+    check(alertsShouldWrite(last: a, lastAt: 100, cur: a, now: 100 + ALERTS_HEARTBEAT), "same set at 30s → heartbeat")
+    check(alertsShouldWrite(last: a, lastAt: 100, cur: AlertsPayload(), now: 101), "set changed → write now")
+    // 2초 폴링 120초 모의: 변화 2번(t=10, t=50) + heartbeat
+    var last: AlertsPayload?, lastAt = 0.0, writes: [Double] = []
+    for t in stride(from: 0.0, through: 120, by: 2) {
+        let cur = t >= 50 ? AlertsPayload() : (t >= 10 ? a : AlertsPayload())
+        if alertsShouldWrite(last: last, lastAt: lastAt, cur: cur, now: t) { writes.append(t); last = cur; lastAt = t }
+    }
+    check(writes == [0, 10, 40, 50, 80, 110], "2s poll: writes at change + every 30s (\(writes.map { Int($0) }))")
+    check(zip(writes, writes.dropFirst()).allSatisfy { $1 - $0 <= ALERTS_HEARTBEAT }, "gap never over 30s (< 90s stale)")
+
+    print("[5] JSON 형식 v1")
+    let full = AlertsPayload(attention: [.init(sid: "A", since: 1793400000.25)],
+                             done: [.init(sid: "B", doneAt: 1793400100.5, took: 192)])
+    let data = alertsJSON(full, updatedAt: 1793400200.75)
+    let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    check(o != nil && Set(o!.keys) == ["v", "updated_at", "attention", "done"], "top-level keys only")
+    check((o?["v"] as? Int) == 1 && (o?["updated_at"] as? Double) == 1793400200.75, "v=1, updated_at")
+    let at0 = (o?["attention"] as? [[String: Any]])?.first, dn0 = (o?["done"] as? [[String: Any]])?.first
+    check(at0.map { Set($0.keys) == ["sid", "since"] && ($0["sid"] as? String) == "A" && ($0["since"] as? Double) == 1793400000.25 } ?? false,
+          "attention entry {sid, since}")
+    check(dn0.map { Set($0.keys) == ["sid", "done_at", "took"] && ($0["took"] as? Double) == 192 } ?? false,
+          "done entry {sid, done_at, took}")
+    check(!String(decoding: data, as: UTF8.self).contains("name") && !String(decoding: data, as: UTF8.self).contains("title"),
+          "no titles/messages")
+    let emptyO = (try? JSONSerialization.jsonObject(with: alertsJSON(AlertsPayload(), updatedAt: 5))) as? [String: Any]
+    check((emptyO?["attention"] as? [Any])?.isEmpty == true && (emptyO?["done"] as? [Any])?.isEmpty == true, "empty arrays present")
+
+    print("[6] 원자적 쓰기 (임시 폴더)")
+    guard !dir.contains("/developer/kb-usage"), (try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)) != nil
+    else { print("  FAIL bad test dir"); return 1 }
+    let path = (dir as NSString).appendingPathComponent("alerts.json")
+    check(path != ALERTS_PATH, "test path is not the real alerts.json")
+    check(writeAlertsFile(data, path: path) && FileManager.default.contents(atPath: path) == data, "write + read back")
+    let data2 = alertsJSON(AlertsPayload(), updatedAt: 6)
+    check(writeAlertsFile(data2, path: path) && FileManager.default.contents(atPath: path) == data2, "overwrite")
+    check(!FileManager.default.fileExists(atPath: path + ".tmp"), "no temp file left")
+    check(!writeAlertsFile(Data(), path: path) && FileManager.default.contents(atPath: path) == data2, "empty data refused, old file kept")
+    check(!writeAlertsFile(data, path: (dir as NSString).appendingPathComponent("no-such-dir/alerts.json")), "missing folder → false")
+
+    print("\n\(pass) passed, \(fail) failed")
+    return fail == 0 ? 0 : 1
+}
+
 // ── 진입점 ────────────────────────────────────────────
 let argv = CommandLine.arguments
+if argv.count >= 3 && argv[1] == "--selftest-alerts" {
+    exit(alertsSelfTest(argv[2]))
+}
 if argv.count >= 3 && argv[1] == "--render-icon" {
     renderIconSheet(argv[2])
     exit(0)
